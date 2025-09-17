@@ -1,0 +1,12 @@
+{
+  "name": "limi-webhook",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.42.0",
+    "openai": "^4.0.0",
+    "twilio": "^4.20.0"
+  }
+}
