@@ -19,7 +19,11 @@ export default async function handler(req, res) {
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString('utf8');
     const params = new URLSearchParams(raw);
-    const from = params.get('From');
+    const rawFrom = params.get('From') || '';
+    const from = rawFrom
+    .replace(/^whatsapp:/i, '')   // remove "whatsapp:"
+    .replace(/^sms:/i, '')        // just in case Twilio adds "sms:"
+    .trim();
     const body = (params.get('Body') || '').trim();
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
