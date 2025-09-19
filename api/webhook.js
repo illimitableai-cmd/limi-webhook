@@ -123,6 +123,67 @@ export default async function handler(req, res) {
     }
 
     // Commands (processed before AI)
+
+    // ADD CONTACT Jon +447700000000
+const addC = /^add contact\s+([a-zA-Z][a-zA-Z\s'-]{1,40})\s+(\+?\d[\d\s()+-]{6,})$/i.exec(body);
+if (addC) {
+  const [, name, phone] = addC;
+  await supabase.from('contacts').upsert(
+    { user_id: userId, name: name.trim(), phone: phone.replace(/\s+/g,'') },
+    { onConflict: 'user_id,name' }
+  );
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
+}
+
+// “remind me tomorrow at 08:00 to bring coffee”
+let m = /^remind me (?:tomorrow|tmrw) at (\d{1,2}:\d{2})\s+to\s+(.+)$/i.exec(body);
+if (m) {
+  const [, hhmm, text] = m;
+  const d = new Date(); d.setDate(d.getDate()+1);
+  const [h, mi] = hhmm.split(':').map(Number);
+  d.setHours(h, mi, 0, 0);
+  await supabase.from('reminders').insert({
+    user_id: userId, text, run_at: d.toISOString(),
+    tz: (summary?.timezone || 'Europe/London'), status: 'scheduled'
+  });
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
+}
+
+// “remind me on 2025-02-14 at 19:00 to book dinner”
+m = /^remind me on (\d{4}-\d{2}-\d{2}) (?:at )?(\d{1,2}:\d{2})\s+to\s+(.+)$/i.exec(body);
+if (m) {
+  const [, ymd, hhmm, text] = m;
+  const d = new Date(`${ymd}T${hhmm}:00Z`);
+  await supabase.from('reminders').insert({
+    user_id: userId, text, run_at: d.toISOString(),
+    tz: (summary?.timezone || 'Europe/London'), status: 'scheduled'
+  });
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
+}
+
+// “send me a text on my birthday”
+m = /^send me a text (?:on|at)? my birthday\b/i.exec(body);
+if (m) {
+  const bday = (summary?.birthday);
+  if (!bday) {
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send('<Response><Message>I don’t know your birthday yet.</Message></Response>');
+  }
+  const now = new Date();
+  const [Y,M,D] = bday.split('-').map(Number);
+  let when = new Date(Date.UTC(now.getUTCFullYear(), M-1, D, 9, 0, 0));
+  if (when < now) when = new Date(Date.UTC(now.getUTCFullYear()+1, M-1, D, 9, 0, 0));
+  await supabase.from('reminders').insert({
+    user_id: userId, text: 'Happy birthday! 🎉', run_at: when.toISOString(),
+    tz: (summary?.timezone || 'Europe/London'), status: 'scheduled'
+  });
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send('<Response><Message>Birthday text scheduled.</Message></Response>');
+}
+
     // BUY -> send top-up link
     if (/^buy\b/i.test(body)) {
       res.setHeader('Content-Type', 'text/xml');
