@@ -298,42 +298,6 @@ if (/^buy\b/i.test(cmd)) {
         .send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
     }
 
-    // SEND TEXT TO CONTACT (charge a credit)
-    const sendC =
-      /^(?:send|text|message)\s+(?:a\s+)?(?:text\s+)?to\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(cmd);
-    if (sendC) {
-      const [, nameRaw, msg] = sendC;
-      const name = nameRaw.trim().toLowerCase();
-
-      const { data: list } = await supabase
-        .from('contacts').select('name,phone').eq('user_id', userId);
-      const contact = (list || []).find(c => c.name.toLowerCase() === name);
-
-      if (!contact) {
-        res.setHeader('Content-Type','text/xml');
-        return res.status(200).send(
-          `<Response><Message>No contact '${nameRaw}'. Try: ADD CONTACT ${nameRaw} +44...</Message></Response>`
-        );
-      }
-
-      await twilioClient.messages.create({
-        to: contact.phone,
-        from: TWILIO_FROM,
-        body: msg.slice(0, 320)
-      });
-
-      await supabase.from('messages').insert([
-        { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }
-      ]);
-
-      // Charge a credit for this request
-      const newBalNow = (bal?.balance ?? 1) - 1;
-      await supabase.from('credits').upsert({ user_id: userId, balance: newBalNow });
-
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
-    }
-
     // ---- AI flow (also charges a credit) ----
 
     // Extract & merge memory
