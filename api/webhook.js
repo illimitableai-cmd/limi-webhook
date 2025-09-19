@@ -85,6 +85,79 @@ New user message: "${newMessage}"`;
     return {};
   }
 }
+async function routeIntent(openaiClient, prior, text) {
+  const sys = `You are an intent router for an SMS assistant (Limi).
+Return ONLY compact JSON (no prose).
+
+type Output = {
+  action: "add_contact" | "send_text" | "set_reminder" | "link_email" | "none";
+  params?: Record<string, string>;
+};
+
+Rules:
+- Infer intent from natural language; don't require exact phrases.
+- Extract concise params:
+  - add_contact: { name, phone }
+  - send_text: { name, message }
+  - set_reminder: { when, text }  // accept natural time like "tomorrow 8am", "2025-02-14 19:00"
+  - link_email: { email }
+- If unsure or missing key info, return { "action": "none" }.
+- Do NOT include explanations.`;
+
+  const user = `Memory: ${JSON.stringify(prior || {})}
+Message: ${text}`;
+
+  const comp = await openaiClient.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    temperature: 0,
+    max_tokens: 120
+  });
+
+  try {
+    const t = comp.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+  } catch {
+    return { action: "none" };
+  }
+}
+// quick iso-ish parser for common natural "when" phrases
+function parseWhen(str, tzGuess = "Europe/London") {
+  // very lightweight: “tomorrow 08:00”, “in 2 hours”, “2025-12-24 17:00”
+  const now = new Date();
+  const lower = (str || "").toLowerCase().trim();
+
+  // ISO-like
+  const iso = lower.match(/\d{4}-\d{2}-\d{2}(\s+|\s*at\s*)(\d{1,2}:\d{2})/);
+  if (iso) return new Date(`${iso[0].replace(" at ", " ") }:00Z`);
+
+  // tomorrow HH:MM
+  const tom = lower.match(/tomorrow\s+(\d{1,2}:\d{2})/);
+  if (tom) {
+    const [h,m] = tom[1].split(":").map(Number);
+    const d = new Date();
+    d.setDate(d.getDate()+1); d.setHours(h,m,0,0);
+    return d;
+  }
+
+  // in N hours / minutes
+  const inH = lower.match(/in\s+(\d+)\s*hours?/);
+  if (inH) { const d = new Date(now); d.setHours(d.getHours()+Number(inH[1])); return d; }
+  const inM = lower.match(/in\s+(\d+)\s*mins?|minutes?/);
+  if (inM) { const d = new Date(now); d.setMinutes(d.getMinutes()+Number(inM[1])); return d; }
+
+  // HH:MM today/tomorrow guess
+  const hm = lower.match(/(\d{1,2}:\d{2})/);
+  if (hm) {
+    const [h,m] = hm[1].split(":").map(Number);
+    const d = new Date(); d.setHours(h,m,0,0);
+    if (d < now) d.setDate(d.getDate()+1); // if passed, schedule for tomorrow
+    return d;
+  }
+
+  return null;
+}
 
 // ---------- Handler ----------
 export default async function handler(req, res) {
@@ -102,6 +175,16 @@ export default async function handler(req, res) {
     const rawFrom = params.get('From') || '';
     const from = rawFrom.replace(/^whatsapp:/i, '').replace(/^sms:/i, '').trim();
     const body = (params.get('Body') || '').trim();
+    // Normalize for command matching (strip polite openers, collapse spaces)
+    let cmd = body
+      .replace(/^(please|plz|hey|hi|hello|yo|limi|hey limi|hi limi)[,!\s:-]*/i, '')
+      .replace(/\?+$/,'')
+      .replace(/\s+/g,' ')
+      .trim();
+
+    // 👇 Debug log to see what came in and how it was normalized
+    console.log('webhook', { from, body, cmd });
+
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
 
@@ -124,83 +207,86 @@ export default async function handler(req, res) {
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
     const prior = mem?.summary ?? blankMemory();
     const tz = prior.timezone || 'Europe/London';
+// --- Intent routing (LLM decides action) ---
+const intent = await routeIntent(openai, prior, body);
+console.log('intent', intent);
 
-    // --- Commands (processed before AI) ---
+if (intent?.action && intent.action !== 'none') {
+  const a = intent.action;
+  const p = intent.params || {};
 
-    // BUY -> send top-up link (free)
-    if (/^buy\b/i.test(body)) {
+  // Free actions first (no credit):
+  if (a === 'link_email' && p.email) {
+    await supabase.from('identifiers').upsert({ user_id: userId, type: 'email', value: p.email.toLowerCase() });
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send(`<Response><Message>Linked email: ${p.email}</Message></Response>`);
+  }
+
+  if (a === 'add_contact' && p.name && p.phone) {
+    await supabase.from('contacts').upsert(
+      { user_id: userId, name: p.name.trim(), phone: (p.phone||'').replace(/\s+/g,'') },
+      { onConflict: 'user_id,name' }
+    );
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send(`<Response><Message>Saved ${p.name}</Message></Response>`);
+  }
+
+  if (a === 'set_reminder' && p.when && p.text) {
+    const when = parseWhen(p.when, tz) || new Date(p.when);
+    if (!when || Number.isNaN(+when)) {
+      res.setHeader('Content-Type','text/xml');
+      return res.status(200).send('<Response><Message>I couldn’t parse the time.</Message></Response>');
+    }
+    await supabase.from('reminders').insert({
+      user_id: userId, text: p.text, run_at: when.toISOString(), tz, status: 'scheduled'
+    });
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
+  }
+
+  // CREDITED action: send_text
+  if (a === 'send_text' && p.name && p.message) {
+    // check credits
+    const { data: bal } = await supabase
+      .from('credits').select('balance').eq('user_id', userId).maybeSingle();
+    if (!bal || bal.balance <= 0) {
       res.setHeader('Content-Type', 'text/xml');
-      return res
-        .status(200)
-        .send('<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>');
+      return res.status(200).send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
     }
 
-    // LINK EMAIL me@domain.com (free)
-    const linkMatch = /^link email\s+(.+)$/i.exec(body);
-    if (linkMatch) {
-      const email = linkMatch[1].trim().toLowerCase();
-      await supabase.from('identifiers').upsert({ user_id: userId, type: 'email', value: email });
-      res.setHeader('Content-Type', 'text/xml');
-      return res.status(200).send(`<Response><Message>Linked email: ${email}</Message></Response>`);
-    }
+    const { data: list } = await supabase
+      .from('contacts').select('name,phone').eq('user_id', userId);
+    const contact = (list || []).find(c => c.name.toLowerCase() === p.name.trim().toLowerCase());
 
-    // ADD CONTACT Jon +447700000000 (free)
-    const addC = /^add contact\s+([a-zA-Z][a-zA-Z\s'-]{1,40})\s+(\+?\d[\d\s()+-]{6,})$/i.exec(body);
-    if (addC) {
-      const [, name, phone] = addC;
-      await supabase.from('contacts').upsert(
-        { user_id: userId, name: name.trim(), phone: phone.replace(/\s+/g,'') },
-        { onConflict: 'user_id,name' }
-      );
+    if (!contact) {
       res.setHeader('Content-Type','text/xml');
-      return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
+      return res.status(200).send(`<Response><Message>No contact "${p.name}". Try: add contact ${p.name} +44...</Message></Response>`);
     }
 
-    // “remind me tomorrow at 08:00 to bring coffee” (free)
-    let m = /^remind me (?:tomorrow|tmrw) at (\d{1,2}:\d{2})\s+to\s+(.+)$/i.exec(body);
-    if (m) {
-      const [, hhmm, text] = m;
-      const d = new Date(); d.setDate(d.getDate()+1);
-      const [h, mi] = hhmm.split(':').map(Number);
-      d.setHours(h, mi, 0, 0);
-      await supabase.from('reminders').insert({
-        user_id: userId, text, run_at: d.toISOString(), tz, status: 'scheduled'
-      });
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
-    }
+    await twilioClient.messages.create({
+      to: contact.phone, from: TWILIO_FROM, body: p.message.slice(0,320)
+    });
 
-    // “remind me on 2025-02-14 at 19:00 to book dinner” (free)
-    m = /^remind me on (\d{4}-\d{2}-\d{2}) (?:at )?(\d{1,2}:\d{2})\s+to\s+(.+)$/i.exec(body);
-    if (m) {
-      const [, ymd, hhmm, text] = m;
-      const d = new Date(`${ymd}T${hhmm}:00Z`);
-      await supabase.from('reminders').insert({
-        user_id: userId, text, run_at: d.toISOString(), tz, status: 'scheduled'
-      });
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
-    }
+    await supabase.from('messages').insert([
+      { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${p.message.slice(0,320)}` }
+    ]);
 
-    // “send me a text on my birthday” (free)
-    m = /^send me a text (?:on|at)? my birthday\b/i.exec(body);
-    if (m) {
-      const bday = prior.birthday;
-      if (!bday) {
-        res.setHeader('Content-Type','text/xml');
-        return res.status(200).send('<Response><Message>I don’t know your birthday yet.</Message></Response>');
-      }
-      const now = new Date();
-      const [Y,M,D] = bday.split('-').map(Number);
-      let when = new Date(Date.UTC(now.getUTCFullYear(), M-1, D, 9, 0, 0));
-      if (when < now) when = new Date(Date.UTC(now.getUTCFullYear()+1, M-1, D, 9, 0, 0));
-      await supabase.from('reminders').insert({
-        user_id: userId, text: 'Happy birthday! 🎉', run_at: when.toISOString(), tz, status: 'scheduled'
-      });
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>Birthday text scheduled.</Message></Response>');
-    }
+    await supabase.from('credits').upsert({ user_id: userId, balance: (bal.balance - 1) });
 
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
+  }
+
+  // If action had missing params fall through to chat
+}
+    
+if (/^buy\b/i.test(cmd)) {
+  res.setHeader('Content-Type', 'text/xml');
+  return res.status(200)
+    .send('<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>');
+}
+
+    
     // --- Credits (simple) ---
     const { data: bal } = await supabase
       .from('credits').select('balance').eq('user_id', userId).maybeSingle();
@@ -213,7 +299,8 @@ export default async function handler(req, res) {
     }
 
     // SEND TEXT TO CONTACT (charge a credit)
-    const sendC = /^send (?:a )?text to\s+([a-zA-Z][a-zA-Z\s'-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(body);
+    const sendC =
+      /^(?:send|text|message)\s+(?:a\s+)?(?:text\s+)?to\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(cmd);
     if (sendC) {
       const [, nameRaw, msg] = sendC;
       const name = nameRaw.trim().toLowerCase();
