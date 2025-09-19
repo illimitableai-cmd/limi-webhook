@@ -175,18 +175,16 @@ export default async function handler(req, res) {
     const rawFrom = params.get('From') || '';
     const from = rawFrom.replace(/^whatsapp:/i, '').replace(/^sms:/i, '').trim();
     const body = (params.get('Body') || '').trim();
-    // ADD / SAVE CONTACT
-    let addC =
-      /^(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s*(\+?\d[\d\s()+-]{6,})$/i.exec(cmd)
-      || /^(?:add|save)\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[:\s-]*\s*(\+?\d[\d\s()+-]{6,})$/i.exec(cmd)
-      || /^can you\s+save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[:\s-]*\s*(\+?\d[\d\s()+-]{6,})$/i.exec(cmd);
-    // SEND TEXT
-    const sendC =
-      /^(?:send|text|message)\s+(?:a\s+)?(?:text\s+)?to\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(cmd);
-
+    // Normalise for command matching (strip polite openers, collapse spaces)
+    const cmd = body
+      .replace(/^(please|plz|hey|hi|hello|yo|limi|hey limi|hi limi)[,!\s:-]*/i, '')
+      .replace(/\?+$/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
     // 👇 Debug log to see what came in and how it was normalized
     console.log('webhook', { from, body, cmd });
+    console.log('intent', intent);
 
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
