@@ -271,26 +271,31 @@ if (intent?.action && intent.action !== 'none') {
   const p = intent.params || {};
 
   // ADD CONTACT: accept phone or try to find one anywhere in the raw body
-  if (a === 'add_contact') {
-    const name  = (p.name || '').trim();
-    const phone = (p.phone || findPhone(body));
+if (a === 'add_contact') {
+  const nameRaw  = (p.name || '').trim();
+  const phoneRaw = (p.phone || findPhone(body));
 
-    if (!name || !phone) {
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>I need a name and a phone to save a contact.</Message></Response>');
-    }
+  const name  = titleCaseName(nameRaw);
+  const phone = phoneRaw ? normalizeUkPhone(phoneRaw) : null;
 
-    const { error: cErr } = await supabase
-      .from('contacts')
-      .upsert({ user_id: userId, name, phone: phone.replace(/\s+/g,'') }, { onConflict: 'user_id,name' });
-
+  if (!name || !phone) {
     res.setHeader('Content-Type','text/xml');
-    if (cErr) {
-      console.error('contacts upsert error', cErr);
-      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-    }
-    return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
+    return res.status(200).send('<Response><Message>I need a name and a phone to save a contact.</Message></Response>');
   }
+
+  console.error('contact_save_llm', { name, phone });
+
+  const { error: cErr } = await supabase
+    .from('contacts')
+    .upsert({ user_id: userId, name, phone }, { onConflict: 'user_id,name' });
+
+  res.setHeader('Content-Type','text/xml');
+  if (cErr) {
+    console.error('contacts upsert error', cErr);
+    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+  }
+  return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
+}
 
   // SEND TEXT
   if (a === 'send_text') {
@@ -348,119 +353,74 @@ if (intent?.action && intent.action !== 'none') {
 
 
 
-// ----- TEMP FALLBACK: contacts + send text (robust) -----
-/**
- * We parse name and phone separately so it also works when there's no space
- * between "contact?" and the phone (e.g. "contact?+4477...") or when the
- * phone is on a new line.
- */
-let matched = false;
+// ----- FALLBACK: add contact from messy phrasing (single path) -----
+{
+  // 1) Grab the first phone-like string anywhere in the raw body (handles newlines, spaces, (), -)
+  const phoneInBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
 
-// 1) Find a phone number anywhere in the original body
-const phoneFromBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || []).pop();
+  // 2) Patterns that work in *either* order & across newlines
+  const patterns = [
+    // add/save ... <number> ... contact ... <name>
+    /(?:^|\b)(?:add|save)\b[\s\S]*?(\+?\d[\d\s()+-]{6,})[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})\b/i,
 
-// 2) Find a “save contact” intent + name in the normalized text
-const nameSaveMatch =
-  /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd) ||
-  /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
-// If we have both a name and a phone, save the contact now
-    // EXTRA "any order" patterns:
-const anyOrder1 = /(?:^|\b)(?:add|save)\b.*?(\+?\d[\d\s()+-]{6,}).*?\bcontact\b.*?([a-zA-Z][a-zA-Z\s'’-]{1,40})/i.exec(body);
-const anyOrder2 = /(?:^|\b)(?:add|save)\b.*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40}).*?(\+?\d[\d\s()+-]{6,})/i.exec(body);
+    // add/save ... contact ... <name> ... <number>
+    /(?:^|\b)(?:add|save)\b[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
 
-let fallbackName = null;
-let fallbackPhone = null;
+    // save <name> as a contact ... <number>
+    /(?:^|\b)save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
 
-if (anyOrder1) {
-  fallbackPhone = anyOrder1[1];
-  fallbackName  = anyOrder1[2];
-} else if (anyOrder2) {
-  fallbackName  = anyOrder2[1];
-  fallbackPhone = anyOrder2[2];
-} else if ((nameSaveMatch1 || nameSaveMatch2) && phoneFromBody) {
-  fallbackName  = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]);
-  fallbackPhone = phoneFromBody;
-}
+    // add/save number <number> under/for <name>
+    /(?:^|\b)(?:add|save)\b[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})[\s\S]*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
 
-if (fallbackName && fallbackPhone) {
-  const contactName = fallbackName.trim().replace(/\s+/g, ' ')
-    .replace(/\b\w/g, c => c.toUpperCase()); // nice capitalization
-  const phoneClean  = fallbackPhone.replace(/\s+/g, '');
+    // add/save <name> ... number <number>
+    /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})/i,
+  ];
 
-  console.error('fallback_contact_upsert', { contactName, phoneClean });
+  let rawName = null, rawPhone = null;
 
-  const { error: cErr } = await supabase
-    .from('contacts')
-    .upsert(
-      { user_id: userId, name: contactName, phone: phoneClean },
-      { onConflict: 'user_id,name' }
-    );
-
-  res.setHeader('Content-Type','text/xml');
-  if (cErr) {
-    console.error('contacts upsert error', cErr);
-    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-  }
-  return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
-}
-
-if (nameSaveMatch && phoneFromBody) {
-  matched = true;
-  const contactName = nameSaveMatch[1].trim();
-  const phoneClean  = phoneFromBody.replace(/\s+/g, '');
-
-  console.error('fallback_contact_upsert', { contactName, phoneClean });
-
-  const { error: cErr } = await supabase
-    .from('contacts')
-    .upsert(
-      { user_id: userId, name: contactName, phone: phoneClean },
-      { onConflict: 'user_id,name' } // requires unique index on (user_id, name)
-    );
-
-  res.setHeader('Content-Type','text/xml');
-  if (cErr) {
-    console.error('contacts upsert error', cErr);
-    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-  }
-  return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
-}
-
-// 3) Send a text: "send a text to Louise Hart saying I love you"
-const sendTextMatch =
-  /(?:^| )(?:send|text|message)\s+(?:a\s+)?(?:text\s+)?to\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(cmd);
-
-if (sendTextMatch) {
-  matched = true;
-  const [, nameRaw, msg] = sendTextMatch;
-  const name = nameRaw.trim().toLowerCase();
-
-  const { data: list, error: listErr } = await supabase
-    .from('contacts').select('name,phone').eq('user_id', userId);
-  if (listErr) console.error('contacts select err', listErr);
-
-  const contact = (list || []).find(c => c.name.toLowerCase() === name);
-  res.setHeader('Content-Type','text/xml');
-
-  if (!contact) {
-    return res.status(200).send(
-      `<Response><Message>No contact "${nameRaw}". Try: add contact ${nameRaw} +44...</Message></Response>`
-    );
+  // 3) Try the robust patterns first
+  for (const r of patterns) {
+    const m = r.exec(body);
+    if (m) {
+      // Decide which capture is the phone vs name
+      if (/\d/.test(m[1])) { rawPhone = m[1]; rawName = m[2]; }
+      else { rawName = m[1]; rawPhone = m[2]; }
+      break;
+    }
   }
 
-  await twilioClient.messages.create({
-    to: contact.phone,
-    from: TWILIO_FROM,
-    body: msg.slice(0, 320)
-  });
+  // 4) If patterns didn’t find both, fall back to earlier simple matches + any phone found
+  // (assumes you still have nameSaveMatch1/nameSaveMatch2 from above)
+  if (!rawName && (typeof nameSaveMatch1 !== 'undefined' || typeof nameSaveMatch2 !== 'undefined')) {
+    rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
+  }
+  if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
 
-  await supabase.from('messages').insert([
-    { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }
-  ]);
+  // 5) If we have both, normalize + save
+  if (rawName && rawPhone) {
+    const contactName = titleCaseName(rawName);
+    const phoneClean  = normalizeUkPhone(rawPhone);
 
-  return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
+    console.error('contact_save_fallback', { contactName, phoneClean, source: 'regex' });
+
+    const { error: cErr } = await supabase
+      .from('contacts')
+      .upsert(
+        { user_id: userId, name: contactName, phone: phoneClean },
+        { onConflict: 'user_id,name' } // requires UNIQUE on (user_id, name)
+      );
+
+    res.setHeader('Content-Type','text/xml');
+    if (cErr) {
+      console.error('contacts upsert error', cErr);
+      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+    }
+    return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
+  }
 }
-// ----- END TEMP FALLBACK -----
+// ----- END FALLBACK -----
+
+
 
     
 if (/^buy\b/i.test(cmd)) {
@@ -468,8 +428,6 @@ if (/^buy\b/i.test(cmd)) {
   return res.status(200)
     .send('<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>');
 }
-
-    
     // --- Credits (simple) ---
     const { data: bal } = await supabase
       .from('credits').select('balance').eq('user_id', userId).maybeSingle();
@@ -481,6 +439,8 @@ if (/^buy\b/i.test(cmd)) {
         .send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
     }
 
+
+    
     // ---- AI flow (also charges a credit) ----
 
     // Extract & merge memory
