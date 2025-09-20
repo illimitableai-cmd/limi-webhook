@@ -140,18 +140,23 @@ function findPhone(str='') {
   if (!m) return null;
   return m[1].replace(/\s+/g, '');
 }
-// Normalize UK phones to +44 format
-function normalizeUkPhone(p) {
-  const d = p.replace(/\s+/g,'');
-  if (d.startsWith('+')) return d;
-  if (d.startsWith('07')) return '+44' + d.slice(1);
-  return d; // leave others unchanged
+
+// Normalize UK phones to +44 E.164-ish format
+function normalizeUkPhone(p='') {
+  if (!p) return p;
+  let d = p.replace(/[^\d+]/g, ''); // keep only + and digits
+  if (d.startsWith('00')) d = '+' + d.slice(2);
+  if (d.startsWith('+44')) return d;
+  if (d.startsWith('+')) return d;          // other countries, leave as-is
+  if (d.startsWith('0')) return '+44' + d.slice(1); // UK local -> +44
+  return d; // already digits without +; leave as-is
 }
+
 
 // Title-case a name (Louise Hart instead of louise hart)
 function titleCaseName(n='') {
-  return n.trim().replace(/\s+/g,' ')
-    .replace(/\b\w/g, c => c.toUpperCase());
+  const s = n.trim().replace(/\s+/g,' ').toLowerCase();
+  return s.replace(/\b\w/g, c => c.toUpperCase());
 }
 // quick iso-ish parser for common natural "when" phrases
 function parseWhen(str, tzGuess = "Europe/London") {
@@ -248,10 +253,7 @@ console.error('webhook_in', { from, body, cmd });
     const tz = prior.timezone || 'Europe/London';
 
     console.error('debug_body_cmd', { body, cmd });
-
-    const phoneFromBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || []).pop();
-    console.error('debug_phoneFromBody', { phoneFromBody });
-
+  
     const nameSaveMatch1 =
       /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
     const nameSaveMatch2 =
@@ -372,8 +374,9 @@ if (a === 'add_contact') {
     // add/save number <number> under/for <name>
     /(?:^|\b)(?:add|save)\b[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})[\s\S]*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
 
-    // add/save <name> ... number <number>
-    /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})/i,
+    // add/save <name> ... <number>  (no explicit 'contact' word)
+     /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
+
   ];
 
   let rawName = null, rawPhone = null;
@@ -487,3 +490,9 @@ if (/^buy\b/i.test(cmd)) {
     return res.status(200).send('<Response><Message>Sorry, something went wrong.</Message></Response>');
   }
 }
+
+if (cErr) {
+  console.error('contacts upsert error', { code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint });
+  ...
+}
+
