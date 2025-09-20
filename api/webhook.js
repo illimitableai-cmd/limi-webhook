@@ -255,8 +255,6 @@ export default async function handler(req, res) {
         .from('identifiers').insert([{ user_id: userId, type: 'phone', value: from }]);
     }
     
-    await dbg('user_identified', { userId, from });
-
     // --- Load prior memory EARLY (some commands use it) ---
     const { data: mem } = await supabase
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
@@ -475,8 +473,6 @@ await dbg('contact_upsert_try', { name: contactName, phone: phoneClean }, userId
 
   ];
 
-  let rawName = null, rawPhone = null;
-
   // 3) Try the robust patterns first
   for (const r of patterns) {
     const m = r.exec(body);
@@ -500,6 +496,30 @@ await dbg('contact_upsert_try', { name: contactName, phone: phoneClean }, userId
     const contactName = titleCaseName(rawName);
     const phoneClean  = normalizeUkPhone(rawPhone);
 
+let rawName = null, rawPhone = null;
+
+if (directSave && phoneInBody) {
+  rawName  = directSave[1];
+  rawPhone = phoneInBody;
+} else {
+  for (const r of patterns) {
+    const m = r.exec(body);
+    if (m) {
+      if (/\d/.test(m[1])) { rawPhone = m[1]; rawName = m[2]; }
+      else { rawName = m[1]; rawPhone = m[2]; }
+      break;
+    }
+  }
+  const nameSaveMatch1 =
+    /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
+  const nameSaveMatch2 =
+    /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
+  if (!rawName) rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
+  if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
+}
+
+await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
+    
     console.error('contact_save_fallback', { contactName, phoneClean, source: 'regex' });
 
     const { error: cErr } = await supabase
