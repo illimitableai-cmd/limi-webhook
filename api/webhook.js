@@ -181,10 +181,16 @@ export default async function handler(req, res) {
       .replace(/\?+$/, '')
       .replace(/\s+/g, ' ')
       .trim();
-
-    // 👇 Debug log to see what came in and how it was normalized
-    console.log('webhook', { from, body, cmd });
-
+    // DEBUG: confirm env + inbound payload (use error so it always shows)
+    console.error('env_ok', {
+      openai: !!process.env.OPENAI_KEY,
+      supabase_url: !!process.env.SUPABASE_URL,
+      supabase_key: !!process.env.SUPABASE_KEY,
+      twilio_sid: !!process.env.TWILIO_SID,
+      twilio_auth: !!process.env.TWILIO_AUTH,
+      twilio_from: !!process.env.TWILIO_FROM,
+});
+console.error('webhook_in', { from, body, cmd });
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
 
@@ -207,9 +213,57 @@ export default async function handler(req, res) {
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
     const prior = mem?.summary ?? blankMemory();
     const tz = prior.timezone || 'Europe/London';
+    // ----- TEMP FALLBACK: bypass LLM router for common commands -----
+let m;
+
+// add/save contact: "save Louise Hart as a contact +447786..." OR "... contact? +447..."
+m = /(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd)
+  || /(?:add|save)\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[:\s-]*\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd)
+  || /can you\s+save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[:\s-]*\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd);
+
+if (m) {
+  const [, name, phone] = m;
+  await supabase.from('contacts').upsert(
+    { user_id: userId, name: name.trim(), phone: phone.replace(/\s+/g, '') },
+    { onConflict: 'user_id,name' }
+  );
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send(`<Response><Message>Saved ${name.trim()}</Message></Response>`);
+}
+
+// send text: "send a text to Louise Hart saying I love you"
+m = /(?:send|text|message)\s+(?:a\s+)?(?:text\s+)?to\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(cmd);
+if (m) {
+  const [, nameRaw, msg] = m;
+  const name = nameRaw.trim().toLowerCase();
+  const { data: list } = await supabase
+    .from('contacts').select('name,phone').eq('user_id', userId);
+  const contact = (list || []).find(c => c.name.toLowerCase() === name);
+
+  if (!contact) {
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send(
+      `<Response><Message>No contact "${nameRaw}". Try: add contact ${nameRaw} +44...</Message></Response>`
+    );
+  }
+
+  // Twilio trial can only send to verified numbers
+  await twilioClient.messages.create({
+    to: contact.phone, from: TWILIO_FROM, body: msg.slice(0, 320)
+  });
+
+  await supabase.from('messages').insert([
+    { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }
+  ]);
+
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
+}
+// ----- END TEMP FALLBACK -----
+
 // --- Intent routing (LLM decides action) ---
 const intent = await routeIntent(openai, prior, body);
-console.log('intent', intent);
+console.error('intent_out', intent);
 
 if (intent?.action && intent.action !== 'none') {
   const a = intent.action;
