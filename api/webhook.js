@@ -220,11 +220,6 @@ export default async function handler(req, res) {
       return res.status(405).send('Method Not Allowed');
     }
 
-    
-    // ------------------------------------------------------
-
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-
     // Parse Twilio x-www-form-urlencoded body
     const chunks = [];
     for await (const c of req) chunks.push(c);
@@ -357,7 +352,7 @@ const intent = await routeIntent(openai, prior, body);
 if (intent?.action && intent.action !== 'none') {
   const a = intent.action;
   const p = intent.params || {};
-
+}
   // ADD CONTACT: accept phone or try to find one anywhere in the raw body
 if (a === 'add_contact') {
   const nameRaw  = (p.name || '').trim();
