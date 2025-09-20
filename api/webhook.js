@@ -194,6 +194,15 @@ function parseWhen(str, tzGuess = "Europe/London") {
   return null;
 }
 
+async function dbg(step, payload, userId = null) {
+  try {
+    await supabase.from('debug_logs').insert([{ step, payload, user_id: userId }]);
+  } catch (e) {
+    // last resort
+    console.error('dbg insert fail', e);
+  }
+}
+
 // ---------- Handler ----------
 export default async function handler(req, res) {
   try {
