@@ -150,9 +150,6 @@ function normalizeUkPhone(p='') {
   return d;
 }
 
-// add/save <name> ... <number> (no explicit 'contact')
-/(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
-
 function titleCaseName(n='') {
   const s = n.trim().replace(/\s+/g,' ').toLowerCase();
   return s.replace(/\b\w/g, c => c.toUpperCase());
@@ -283,8 +280,14 @@ const tz = prior.timezone || 'Europe/London';
   ];
 
   let rawName = null, rawPhone = null;
-
   await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
+  // after you’ve tried directSave, patterns, and nameSaveMatch…
+  await dbg('contact_fallback_parsed', {
+    rawName,
+    rawPhone,
+    body
+}, userId);
+
 
   if (directSave && phoneInBody) {
     rawName  = directSave[1];
@@ -307,25 +310,38 @@ const tz = prior.timezone || 'Europe/London';
     if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
   }
 
-  if (rawName && rawPhone) {
-    const contactName = titleCaseName(rawName);
-    const phoneClean  = normalizeUkPhone(rawPhone);
-    console.log('contact_save_fallback', { contactName, phoneClean });
+if (rawName && rawPhone) {
+  const contactName = titleCaseName(rawName);
+  const phoneClean  = normalizeUkPhone(rawPhone);
 
-    const { error: cErr } = await supabase
-      .from('contacts')
-      .upsert(
-        { user_id: userId, name: contactName, phone: phoneClean },
-        { onConflict: 'user_id,name' }
-      );
+  // NEW: log exactly what we’re about to save
+  await dbg('contact_upsert_try', { source: 'fallback', name: contactName, phone: phoneClean }, userId);
+
+  const { error: cErr } = await supabase
+    .from('contacts')
+    .upsert(
+      { user_id: userId, name: contactName, phone: phoneClean },
+      { onConflict: 'user_id,name' }
+    );
+
+  if (cErr) {
+    // NEW: capture the exact DB error payload
+    await dbg('contact_upsert_error', {
+      source: 'fallback',
+      code: cErr.code,
+      message: cErr.message,
+      details: cErr.details,
+      hint: cErr.hint
+    }, userId);
 
     res.setHeader('Content-Type','text/xml');
-    if (cErr) {
-      console.error('contacts upsert error', cErr);
-      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-    }
-    return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
+    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
   }
+
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
+}
+
 }
 // ---------- END EARLY FALLBACK ----------
 
@@ -353,19 +369,31 @@ if (a === 'add_contact') {
     return res.status(200).send('<Response><Message>I need a name and a phone to save a contact.</Message></Response>');
   }
 
-  console.error('contact_save_llm', { name, phone });
+  // NEW: log what we’ll upsert via the LLM route
+  await dbg('contact_upsert_try', { source: 'llm', name, phone }, userId);
 
   const { error: cErr } = await supabase
     .from('contacts')
     .upsert({ user_id: userId, name, phone }, { onConflict: 'user_id,name' });
 
-  res.setHeader('Content-Type','text/xml');
   if (cErr) {
-    console.error('contacts upsert error', cErr);
+    // NEW: capture DB error
+    await dbg('contact_upsert_error', {
+      source: 'llm',
+      code: cErr.code,
+      message: cErr.message,
+      details: cErr.details,
+      hint: cErr.hint
+    }, userId);
+
+    res.setHeader('Content-Type','text/xml');
     return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
   }
+
+  res.setHeader('Content-Type','text/xml');
   return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
 }
+
 
   // SEND TEXT
   if (a === 'send_text') {
@@ -558,10 +586,4 @@ if (/^buy\b/i.test(cmd)) {
     return res.status(200).send('<Response><Message>Sorry, something went wrong.</Message></Response>');
   }
 }
-
-if (cErr) {
-  await dbg('contact_upsert_error', { code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint }, userId);
-  ...
-}
-
 
