@@ -264,11 +264,8 @@ const tz = prior.timezone || 'Europe/London';
 // ---------- EARLY FALLBACK: add contact from messy phrasing ----------
 {
   const phoneInBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
-
-  // direct “save X as a contact” (your exact phrasing)
   const directSave = /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(body);
 
-  // any-order robust patterns (across newlines)
   const patterns = [
     /(?:^|\b)(?:add|save)\b[\s\S]*?(\+?\d[\d\s()+-]{6,})[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})\b/i,
     /(?:^|\b)(?:add|save)\b[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
@@ -278,14 +275,6 @@ const tz = prior.timezone || 'Europe/London';
   ];
 
   let rawName = null, rawPhone = null;
-  await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
-  // after you’ve tried directSave, patterns, and nameSaveMatch…
-  await dbg('contact_fallback_parsed', {
-    rawName,
-    rawPhone,
-    body
-}, userId);
-
 
   if (directSave && phoneInBody) {
     rawName  = directSave[1];
@@ -299,7 +288,6 @@ const tz = prior.timezone || 'Europe/London';
         break;
       }
     }
-    // last resort: earlier name matches + any phone found
     const nameSaveMatch1 =
       /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
     const nameSaveMatch2 =
@@ -308,41 +296,39 @@ const tz = prior.timezone || 'Europe/London';
     if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
   }
 
-if (rawName && rawPhone) {
-  const contactName = titleCaseName(rawName);
-  const phoneClean  = normalizeUkPhone(rawPhone);
+  // Log AFTER parsing so we can see what was found
+  await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
 
-  // NEW: log exactly what we’re about to save
-  await dbg('contact_upsert_try', { source: 'fallback', name: contactName, phone: phoneClean }, userId);
+  if (rawName && rawPhone) {
+    const contactName = titleCaseName(rawName);
+    const phoneClean  = normalizeUkPhone(rawPhone);
 
-  const { error: cErr } = await supabase
-    .from('contacts')
-    .upsert(
-      { user_id: userId, name: contactName, phone: phoneClean },
-      { onConflict: 'user_id,name' }
-    );
+    await dbg('contact_upsert_try', { source: 'fallback', name: contactName, phone: phoneClean }, userId);
 
-  if (cErr) {
-    // NEW: capture the exact DB error payload
-    await dbg('contact_upsert_error', {
-      source: 'fallback',
-      code: cErr.code,
-      message: cErr.message,
-      details: cErr.details,
-      hint: cErr.hint
-    }, userId);
+    const { error: cErr } = await supabase
+      .from('contacts')
+      .upsert(
+        { user_id: userId, name: contactName, phone: phoneClean },
+        { onConflict: 'user_id,name' }
+      );
+
+    if (cErr) {
+      await dbg('contact_upsert_error', {
+        source: 'fallback',
+        code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint
+      }, userId);
+
+      res.setHeader('Content-Type','text/xml');
+      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+    }
 
     res.setHeader('Content-Type','text/xml');
-    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+    return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
   }
-
-  res.setHeader('Content-Type','text/xml');
-  return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
-}
-
 }
 // ---------- END EARLY FALLBACK ----------
 
+    
 // Now try the LLM router only if fallback didn’t handle it
 const intent = await routeIntent(openai, prior, body);
 
@@ -446,100 +432,6 @@ if (a === 'add_contact') {
 
   // If we had an action but missing bits, fall through to regex fallback next.
 }
-
-await dbg('contact_upsert_try', { name: contactName, phone: phoneClean }, userId);
-
-// ----- FALLBACK: add contact from messy phrasing (single path) -----
-{
-  // 1) Grab the first phone-like string anywhere in the raw body (handles newlines, spaces, (), -)
-  const phoneInBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
-
-  // 2) Patterns that work in *either* order & across newlines
-  const patterns = [
-    // add/save ... <number> ... contact ... <name>
-    /(?:^|\b)(?:add|save)\b[\s\S]*?(\+?\d[\d\s()+-]{6,})[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})\b/i,
-
-    // add/save ... contact ... <name> ... <number>
-    /(?:^|\b)(?:add|save)\b[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
-
-    // save <name> as a contact ... <number>
-    /(?:^|\b)save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
-
-    // add/save number <number> under/for <name>
-    /(?:^|\b)(?:add|save)\b[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})[\s\S]*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
-
-    // add/save <name> ... <number>  (no explicit 'contact' word)
-     /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
-
-  ];
-
-  // 3) Try the robust patterns first
-  for (const r of patterns) {
-    const m = r.exec(body);
-    if (m) {
-      // Decide which capture is the phone vs name
-      if (/\d/.test(m[1])) { rawPhone = m[1]; rawName = m[2]; }
-      else { rawName = m[1]; rawPhone = m[2]; }
-      break;
-    }
-  }
-
-  // 4) If patterns didn’t find both, fall back to earlier simple matches + any phone found
-  // (assumes you still have nameSaveMatch1/nameSaveMatch2 from above)
-  if (!rawName && (typeof nameSaveMatch1 !== 'undefined' || typeof nameSaveMatch2 !== 'undefined')) {
-    rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
-  }
-  if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
-
-  // 5) If we have both, normalize + save
-  if (rawName && rawPhone) {
-    const contactName = titleCaseName(rawName);
-    const phoneClean  = normalizeUkPhone(rawPhone);
-
-let rawName = null, rawPhone = null;
-
-if (directSave && phoneInBody) {
-  rawName  = directSave[1];
-  rawPhone = phoneInBody;
-} else {
-  for (const r of patterns) {
-    const m = r.exec(body);
-    if (m) {
-      if (/\d/.test(m[1])) { rawPhone = m[1]; rawName = m[2]; }
-      else { rawName = m[1]; rawPhone = m[2]; }
-      break;
-    }
-  }
-  const nameSaveMatch1 =
-    /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
-  const nameSaveMatch2 =
-    /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
-  if (!rawName) rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
-  if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
-}
-
-await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
-    
-    console.error('contact_save_fallback', { contactName, phoneClean, source: 'regex' });
-
-    const { error: cErr } = await supabase
-      .from('contacts')
-      .upsert(
-        { user_id: userId, name: contactName, phone: phoneClean },
-        { onConflict: 'user_id,name' } // requires UNIQUE on (user_id, name)
-      );
-
-    res.setHeader('Content-Type','text/xml');
-    if (cErr) {
-      console.error('contacts upsert error', cErr);
-      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-    }
-    return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
-  }
-}
-// ----- END FALLBACK -----
-
-
 
     
 if (/^buy\b/i.test(cmd)) {
