@@ -144,20 +144,19 @@ function findPhone(str='') {
 // Normalize UK phones to +44 E.164-ish format
 function normalizeUkPhone(p='') {
   if (!p) return p;
-  let d = p.replace(/[^\d+]/g, ''); // keep only + and digits
+  let d = p.replace(/[^\d+]/g, '');
   if (d.startsWith('00')) d = '+' + d.slice(2);
   if (d.startsWith('+44')) return d;
-  if (d.startsWith('+')) return d;          // other countries, leave as-is
-  if (d.startsWith('0')) return '+44' + d.slice(1); // UK local -> +44
-  return d; // already digits without +; leave as-is
+  if (d.startsWith('+')) return d;
+  if (d.startsWith('0')) return '+44' + d.slice(1);
+  return d;
 }
 
-
-// Title-case a name (Louise Hart instead of louise hart)
 function titleCaseName(n='') {
   const s = n.trim().replace(/\s+/g,' ').toLowerCase();
   return s.replace(/\b\w/g, c => c.toUpperCase());
 }
+
 // quick iso-ish parser for common natural "when" phrases
 function parseWhen(str, tzGuess = "Europe/London") {
   // very lightweight: “tomorrow 08:00”, “in 2 hours”, “2025-12-24 17:00”
