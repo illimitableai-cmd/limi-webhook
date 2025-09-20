@@ -192,6 +192,8 @@ export default async function handler(req, res) {
 });
 console.error('webhook_in', { from, body, cmd });
 
+    console.error('DEBUG_CMD', { body, cmd });
+
     if (!from || !body) return res.status(400).send('Missing From/Body');
 
     // Find or create user by identifier
