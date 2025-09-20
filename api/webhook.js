@@ -92,21 +92,18 @@ Return ONLY compact JSON.
 type Output = {
   action: "add_contact" | "send_text" | "set_reminder" | "link_email" | "none",
   params?: {
-    name?: string,       // contact full name if any words look like a human name
-    phone?: string,      // any phone-like string you can find in the text
-    message?: string,    // message text for send_text
-    when?: string,       // natural time
+    name?: string,
+    phone?: string,
+    message?: string,
+    when?: string,
     email?: string
   }
 };
 
 Rules:
-- Understand messy, natural language (any order): e.g. "add 07755... as a contact Ashley Leggett", 
-  "save this number under Ashley", "add Ashley Leggett, number 07755...", etc.
-- If a phone is present in the message anywhere, put it in params.phone exactly as seen.
-- If a human name is present anywhere, put it in params.name (keep it short, capitalized).
-- For send_text, infer params.name and params.message from any order ("text Ashley: running late").
-- If you can’t infer enough for a confident action, return { "action": "none" }. No explanations.`;
+- Understand messy, natural language (any order)...
+- If you can’t infer enough, return {"action":"none"}.
+`;
 
   const user = `Prior memory (may help with names): ${JSON.stringify(prior || {})}
 Message: ${text}`;
@@ -126,36 +123,7 @@ Message: ${text}`;
     return { action: "none" };
   }
 }
-};
 
-Rules:
-- Infer intent from natural language; don't require exact phrases.
-- Extract concise params:
-  - add_contact: { name, phone }
-  - send_text: { name, message }
-  - set_reminder: { when, text }  // accept natural time like "tomorrow 8am", "2025-02-14 19:00"
-  - link_email: { email }
-- If unsure or missing key info, return { "action": "none" }.
-- Do NOT include explanations.`;
-
-  const user = `Memory: ${JSON.stringify(prior || {})}
-Message: ${text}`;
-
-  const comp = await openaiClient.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
-    temperature: 0,
-    max_tokens: 120
-  });
-
-  try {
-    const t = comp.choices[0].message.content || "{}";
-    const s = t.indexOf("{"), e = t.lastIndexOf("}");
-    return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
-  } catch {
-    return { action: "none" };
-  }
-}
   // Pull a phone from any messy text; returns digits with leading +
 function findPhone(str='') {
   const m = str.match(/(\+?\d[\d\s()+-]{6,})/);
@@ -414,10 +382,6 @@ if (sendTextMatch) {
   return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
 }
 // ----- END TEMP FALLBACK -----
-
-if (intent?.action && intent.action !== 'none') {
-  const a = intent.action;
-  const p = intent.params || {};
 
   // Free actions first (no credit):
   if (a === 'link_email' && p.email) {
