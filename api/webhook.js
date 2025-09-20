@@ -225,9 +225,11 @@ export default async function handler(req, res) {
       twilio_auth: !!process.env.TWILIO_AUTH,
       twilio_from: !!process.env.TWILIO_FROM,
 });
-console.error('webhook_in', { from, body, cmd });
-
+    
+    console.error('webhook_in', { from, body, cmd });
     console.error('DEBUG_CMD', { body, cmd });
+    console.log('webhook START');
+    console.log({ from, body });
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
 
@@ -248,24 +250,76 @@ console.error('webhook_in', { from, body, cmd });
     // --- Load prior memory EARLY (some commands use it) ---
     const { data: mem } = await supabase
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
-    const prior = mem?.summary ?? blankMemory();
-    const tz = prior.timezone || 'Europe/London';
+const prior = mem?.summary ?? blankMemory();
+const tz = prior.timezone || 'Europe/London';
 
-    console.error('debug_body_cmd', { body, cmd });
-  
+// ---------- EARLY FALLBACK: add contact from messy phrasing ----------
+{
+  const phoneInBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
+
+  // direct “save X as a contact” (your exact phrasing)
+  const directSave = /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(body);
+
+  // any-order robust patterns (across newlines)
+  const patterns = [
+    /(?:^|\b)(?:add|save)\b[\s\S]*?(\+?\d[\d\s()+-]{6,})[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})\b/i,
+    /(?:^|\b)(?:add|save)\b[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
+    /(?:^|\b)save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
+    /(?:^|\b)(?:add|save)\b[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})[\s\S]*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
+    /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})/i,
+  ];
+
+  let rawName = null, rawPhone = null;
+
+  if (directSave && phoneInBody) {
+    rawName  = directSave[1];
+    rawPhone = phoneInBody;
+  } else {
+    for (const r of patterns) {
+      const m = r.exec(body);
+      if (m) {
+        if (/\d/.test(m[1])) { rawPhone = m[1]; rawName = m[2]; }
+        else { rawName = m[1]; rawPhone = m[2]; }
+        break;
+      }
+    }
+    // last resort: earlier name matches + any phone found
     const nameSaveMatch1 =
       /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
     const nameSaveMatch2 =
       /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
-    console.error('debug_nameSaveMatch', {
-      nameSaveMatch1: nameSaveMatch1 && nameSaveMatch1[1],
-      nameSaveMatch2: nameSaveMatch2 && nameSaveMatch2[1]
-});
+    if (!rawName) rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
+    if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
+  }
 
-// --- LLM FIRST: try to understand any natural phrasing ---
+  if (rawName && rawPhone) {
+    const contactName = titleCaseName(rawName);
+    const phoneClean  = normalizeUkPhone(rawPhone);
+    console.log('contact_save_fallback', { contactName, phoneClean });
+
+    const { error: cErr } = await supabase
+      .from('contacts')
+      .upsert(
+        { user_id: userId, name: contactName, phone: phoneClean },
+        { onConflict: 'user_id,name' }
+      );
+
+    res.setHeader('Content-Type','text/xml');
+    if (cErr) {
+      console.error('contacts upsert error', cErr);
+      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+    }
+    return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
+  }
+}
+// ---------- END EARLY FALLBACK ----------
+
+// Now try the LLM router only if fallback didn’t handle it
 const intent = await routeIntent(openai, prior, body);
+
+    
     console.error('intent_json', JSON.stringify(intent));
-console.error('intent_out', intent);
+    console.error('intent_out', intent);
 
 if (intent?.action && intent.action !== 'none') {
   const a = intent.action;
