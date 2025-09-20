@@ -383,68 +383,6 @@ if (sendTextMatch) {
 }
 // ----- END TEMP FALLBACK -----
 
-  // Free actions first (no credit):
-  if (a === 'link_email' && p.email) {
-    await supabase.from('identifiers').upsert({ user_id: userId, type: 'email', value: p.email.toLowerCase() });
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send(`<Response><Message>Linked email: ${p.email}</Message></Response>`);
-  }
-
-  if (a === 'add_contact' && p.name && p.phone) {
-    await supabase.from('contacts').upsert(
-      { user_id: userId, name: p.name.trim(), phone: (p.phone||'').replace(/\s+/g,'') },
-      { onConflict: 'user_id,name' }
-    );
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send(`<Response><Message>Saved ${p.name}</Message></Response>`);
-  }
-
-  if (a === 'set_reminder' && p.when && p.text) {
-    const when = parseWhen(p.when, tz) || new Date(p.when);
-    if (!when || Number.isNaN(+when)) {
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>I couldn’t parse the time.</Message></Response>');
-    }
-    await supabase.from('reminders').insert({
-      user_id: userId, text: p.text, run_at: when.toISOString(), tz, status: 'scheduled'
-    });
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
-  }
-
-  // CREDITED action: send_text
-  if (a === 'send_text' && p.name && p.message) {
-    // check credits
-    const { data: bal } = await supabase
-      .from('credits').select('balance').eq('user_id', userId).maybeSingle();
-    if (!bal || bal.balance <= 0) {
-      res.setHeader('Content-Type', 'text/xml');
-      return res.status(200).send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
-    }
-
-    const { data: list } = await supabase
-      .from('contacts').select('name,phone').eq('user_id', userId);
-    const contact = (list || []).find(c => c.name.toLowerCase() === p.name.trim().toLowerCase());
-
-    if (!contact) {
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send(`<Response><Message>No contact "${p.name}". Try: add contact ${p.name} +44...</Message></Response>`);
-    }
-
-    await twilioClient.messages.create({
-      to: contact.phone, from: TWILIO_FROM, body: p.message.slice(0,320)
-    });
-
-    await supabase.from('messages').insert([
-      { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${p.message.slice(0,320)}` }
-    ]);
-
-    await supabase.from('credits').upsert({ user_id: userId, balance: (bal.balance - 1) });
-
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
-  }
-
   // If action had missing params fall through to chat
 }
     
