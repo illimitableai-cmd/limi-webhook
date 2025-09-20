@@ -184,7 +184,6 @@ export default async function handler(req, res) {
 
     // 👇 Debug log to see what came in and how it was normalized
     console.log('webhook', { from, body, cmd });
-    console.log('intent', intent);
 
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
