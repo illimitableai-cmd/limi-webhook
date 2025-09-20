@@ -87,28 +87,33 @@ New user message: "${newMessage}"`;
 }
 async function routeIntent(openaiClient, prior, text) {
   const sys = `You are an intent router for an SMS assistant (Limi).
-Return ONLY compact JSON.
+Return ONLY compact JSON (no prose).
 
 type Output = {
   action: "add_contact" | "send_text" | "set_reminder" | "link_email" | "none",
   params?: {
-    name?: string,
-    phone?: string,
-    message?: string,  // for send_text
-    when?: string,     // natural time
-    text?: string,     // for set_reminder (- For set_reminder, capture both:
-  - params.when = time expression ("tomorrow 8am", "in 2 hours")
-  - params.text = what to be reminded about ("call John", "buy milk")
-)
+    name?: string,     // contact full name if any words look like a human name
+    phone?: string,    // any phone-like string found anywhere in the message
+    message?: string,  // message text for send_text
+    when?: string,     // natural time for set_reminder (e.g. "tomorrow 8am", "in 2 hours")
+    text?: string,     // the reminder note for set_reminder (e.g. "call John", "buy milk")
     email?: string
   }
 };
 
-
 Rules:
-- Understand messy, natural language (any order)...
-- If you can’t infer enough, return {"action":"none"}.
-`;
+- Understand messy, natural language in ANY order.
+  Examples:
+    "add 07755... as a contact Ashley Leggett"
+    "save this number under Ashley: 07755..."
+    "text Ashley: running late"
+    "remind me tomorrow 8am to call John"
+- If a phone is present anywhere, put it in params.phone exactly as seen (no formatting required).
+- For set_reminder, capture BOTH:
+    params.when = the time expression
+    params.text = what to be reminded about
+- If you can’t infer enough for a confident action, return {"action":"none"}.
+- NO explanations.`;
 
   const user = `Prior memory (may help with names): ${JSON.stringify(prior || {})}
 Message: ${text}`;
@@ -231,6 +236,7 @@ console.error('webhook_in', { from, body, cmd });
 
 // --- LLM FIRST: try to understand any natural phrasing ---
 const intent = await routeIntent(openai, prior, body);
+    console.error('intent_json', JSON.stringify(intent));
 console.error('intent_out', intent);
 
 if (intent?.action && intent.action !== 'none') {
@@ -330,7 +336,7 @@ const phoneFromBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || []).pop();
 const nameSaveMatch =
   /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd) ||
   /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
-
+console.error('fallback_contact_upsert', { contactName, phoneClean });
 // If we have both a name and a phone, save the contact now
 if (nameSaveMatch && phoneFromBody) {
   matched = true;
@@ -388,8 +394,6 @@ if (sendTextMatch) {
 }
 // ----- END TEMP FALLBACK -----
 
-  // If action had missing params fall through to chat
-}
     
 if (/^buy\b/i.test(cmd)) {
   res.setHeader('Content-Type', 'text/xml');
