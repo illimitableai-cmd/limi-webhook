@@ -391,18 +391,6 @@ if (a === 'add_contact') {
     res.setHeader('Content-Type','text/xml');
     return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
   }
-  await dbg('contact_upsert_error', {
-    source: 'fallback',
-    code: cErr.code,
-    message: cErr.message,
-    details: cErr.details,
-    hint: cErr.hint
-  }, userId);
-
-  res.setHeader('Content-Type','text/xml');
-  return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
-}
-
 
   // SEND TEXT
   if (a === 'send_text') {
