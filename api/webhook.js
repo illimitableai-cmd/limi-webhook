@@ -146,11 +146,12 @@ function normalizeUkPhone(p='') {
   if (!p) return p;
   let d = p.replace(/[^\d+]/g, '');
   if (d.startsWith('00')) d = '+' + d.slice(2);
-  if (d.startsWith('+44')) return d;
-  if (d.startsWith('+')) return d;
-  if (d.startsWith('0')) return '+44' + d.slice(1);
+  if (d.startsWith('0')) d = '+44' + d.slice(1);
   return d;
 }
+
+// add/save <name> ... <number> (no explicit 'contact')
+/(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
 
 function titleCaseName(n='') {
   const s = n.trim().replace(/\s+/g,' ').toLowerCase();
@@ -239,6 +240,7 @@ export default async function handler(req, res) {
     console.error('DEBUG_CMD', { body, cmd });
     console.log('webhook START');
     console.log({ from, body });
+    await dbg('webhook_in', { from, body });
 
     if (!from || !body) return res.status(400).send('Missing From/Body');
 
@@ -255,6 +257,8 @@ export default async function handler(req, res) {
       await supabase
         .from('identifiers').insert([{ user_id: userId, type: 'phone', value: from }]);
     }
+    
+    await dbg('user_identified', { userId, from });
 
     // --- Load prior memory EARLY (some commands use it) ---
     const { data: mem } = await supabase
@@ -279,6 +283,8 @@ const tz = prior.timezone || 'Europe/London';
   ];
 
   let rawName = null, rawPhone = null;
+
+  await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
 
   if (directSave && phoneInBody) {
     rawName  = directSave[1];
@@ -415,7 +421,7 @@ if (a === 'add_contact') {
   // If we had an action but missing bits, fall through to regex fallback next.
 }
 
-
+await dbg('contact_upsert_try', { name: contactName, phone: phoneClean }, userId);
 
 // ----- FALLBACK: add contact from messy phrasing (single path) -----
 {
@@ -554,7 +560,8 @@ if (/^buy\b/i.test(cmd)) {
 }
 
 if (cErr) {
-  console.error('contacts upsert error', { code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint });
+  await dbg('contact_upsert_error', { code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint }, userId);
   ...
 }
+
 
