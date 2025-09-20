@@ -94,11 +94,16 @@ type Output = {
   params?: {
     name?: string,
     phone?: string,
-    message?: string,
-    when?: string,
+    message?: string,  // for send_text
+    when?: string,     // natural time
+    text?: string,     // for set_reminder (- For set_reminder, capture both:
+  - params.when = time expression ("tomorrow 8am", "in 2 hours")
+  - params.text = what to be reminded about ("call John", "buy milk")
+)
     email?: string
   }
 };
+
 
 Rules:
 - Understand messy, natural language (any order)...
