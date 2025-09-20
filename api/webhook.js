@@ -213,26 +213,74 @@ console.error('webhook_in', { from, body, cmd });
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
     const prior = mem?.summary ?? blankMemory();
     const tz = prior.timezone || 'Europe/London';
-    // ----- TEMP FALLBACK: bypass LLM router for common commands -----
+// ----- TEMP FALLBACK: bypass LLM router for common commands -----
 let m;
 
-// add/save contact: "save Louise Hart as a contact +447786..." OR "... contact? +447..."
-m = /(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd)
-  || /(?:add|save)\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[:\s-]*\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd)
-  || /can you\s+save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[:\s-]*\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd);
+// add/save contact:
+// accepts: "save Louise Hart as a contact +447786..." OR "add contact Louise Hart +447..." OR
+// "can you save Louise Hart as a contact? +447..." (note the ? after 'contact')
+m =
+  /(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd) ||
+  /(?:add|save)\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[?:,.\s-]*\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd) ||
+  /can you\s+save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[?:,.\s-]*\s*(\+?\d[\d\s()+-]{6,})/i.exec(cmd);
 
 if (m) {
   const [, name, phone] = m;
-  await supabase.from('contacts').upsert(
-    { user_id: userId, name: name.trim(), phone: phone.replace(/\s+/g, '') },
-    { onConflict: 'user_id,name' }
-  );
+  const payload = {
+    user_id: userId,
+    name: name.trim(),
+    phone: phone.replace(/\s+/g, '')
+  };
+
+  const { error: cErr } = await supabase
+    .from('contacts')
+    .upsert(payload, { onConflict: 'user_id,name' });  // requires a unique index (see step 2 below)
+
+  if (cErr) {
+    console.error('contacts upsert error', cErr);
+    res.setHeader('Content-Type','text/xml');
+    return res
+      .status(200)
+      .send('<Response><Message>Could not save contact right now.</Message></Response>');
+  }
+
   res.setHeader('Content-Type','text/xml');
-  return res.status(200).send(`<Response><Message>Saved ${name.trim()}</Message></Response>`);
+  return res.status(200).send(`<Response><Message>Saved ${payload.name}</Message></Response>`);
 }
 
 // send text: "send a text to Louise Hart saying I love you"
 m = /(?:send|text|message)\s+(?:a\s+)?(?:text\s+)?to\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+(?:that|saying|to)?\s*(.+)$/i.exec(cmd);
+if (m) {
+  const [, nameRaw, msg] = m;
+  const name = nameRaw.trim().toLowerCase();
+
+  const { data: list, error: listErr } = await supabase
+    .from('contacts').select('name,phone').eq('user_id', userId);
+  if (listErr) console.error('contacts select err', listErr);
+
+  const contact = (list || []).find(c => c.name.toLowerCase() === name);
+  if (!contact) {
+    res.setHeader('Content-Type','text/xml');
+    return res
+      .status(200)
+      .send(`<Response><Message>No contact "${nameRaw}". Try: add contact ${nameRaw} +44...</Message></Response>`);
+  }
+
+  await twilioClient.messages.create({
+    to: contact.phone,
+    from: TWILIO_FROM,
+    body: msg.slice(0, 320)
+  });
+
+  await supabase.from('messages').insert([
+    { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }
+  ]);
+
+  res.setHeader('Content-Type','text/xml');
+  return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
+}
+// ----- END TEMP FALLBACK -----
+
 if (m) {
   const [, nameRaw, msg] = m;
   const name = nameRaw.trim().toLowerCase();
