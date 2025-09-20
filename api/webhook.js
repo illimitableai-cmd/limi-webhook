@@ -126,10 +126,6 @@ Message: ${text}`;
     return { action: "none" };
   }
 }
-
-type Output = {
-  action: "add_contact" | "send_text" | "set_reminder" | "link_email" | "none";
-  params?: Record<string, string>;
 };
 
 Rules:
@@ -160,18 +156,17 @@ Message: ${text}`;
     return { action: "none" };
   }
 }
-// quick iso-ish parser for common natural "when" phrases
-function parseWhen(str, tzGuess = "Europe/London") {
-  // very lightweight: “tomorrow 08:00”, “in 2 hours”, “2025-12-24 17:00”
-  const now = new Date();
-  const lower = (str || "").toLowerCase().trim();
-
   // Pull a phone from any messy text; returns digits with leading +
 function findPhone(str='') {
   const m = str.match(/(\+?\d[\d\s()+-]{6,})/);
   if (!m) return null;
   return m[1].replace(/\s+/g, '');
 }
+// quick iso-ish parser for common natural "when" phrases
+function parseWhen(str, tzGuess = "Europe/London") {
+  // very lightweight: “tomorrow 08:00”, “in 2 hours”, “2025-12-24 17:00”
+  const now = new Date();
+  const lower = (str || "").toLowerCase().trim();
 
   // ISO-like
   const iso = lower.match(/\d{4}-\d{2}-\d{2}(\s+|\s*at\s*)(\d{1,2}:\d{2})/);
@@ -419,11 +414,6 @@ if (sendTextMatch) {
   return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
 }
 // ----- END TEMP FALLBACK -----
-
-
-// --- Intent routing (LLM decides action) ---
-const intent = await routeIntent(openai, prior, body);
-console.error('intent_out', intent);
 
 if (intent?.action && intent.action !== 'none') {
   const a = intent.action;
