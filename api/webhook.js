@@ -204,7 +204,25 @@ async function dbg(step, payload, userId = null) {
 // ---------- Handler ----------
 export default async function handler(req, res) {
   try {
-    if (req.method === 'GET') return res.status(200).send('Limi webhook is alive');
+    // ---- TEST HOOK (so you can ping it in a browser) ----
+    if (req.method === 'GET') {
+      if (req.query?.testLog) {
+        await dbg('manual_ping', { from: 'GET test' });
+        return res.status(200).send('logged');
+      }
+      return res.status(200).send('Limi webhook is alive');
+    }
+
+    
+    // ------------------------------------------------------
+
+    if (req.method !== 'POST') {
+      return res.status(405).send('Method Not Allowed');
+    }
+
+    
+    // ------------------------------------------------------
+
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
     // Parse Twilio x-www-form-urlencoded body
@@ -254,7 +272,8 @@ export default async function handler(req, res) {
       await supabase
         .from('identifiers').insert([{ user_id: userId, type: 'phone', value: from }]);
     }
-    
+    await dbg('user_identified', { userId, from });
+      
     // --- Load prior memory EARLY (some commands use it) ---
     const { data: mem } = await supabase
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
@@ -332,7 +351,6 @@ const tz = prior.timezone || 'Europe/London';
 // Now try the LLM router only if fallback didn’t handle it
 const intent = await routeIntent(openai, prior, body);
 
-    
     console.error('intent_json', JSON.stringify(intent));
     console.error('intent_out', intent);
 
@@ -373,6 +391,13 @@ if (a === 'add_contact') {
     res.setHeader('Content-Type','text/xml');
     return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
   }
+  await dbg('contact_upsert_error', {
+    source: 'fallback',
+    code: cErr.code,
+    message: cErr.message,
+    details: cErr.details,
+    hint: cErr.hint
+  }, userId);
 
   res.setHeader('Content-Type','text/xml');
   return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
