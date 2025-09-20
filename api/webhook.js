@@ -336,12 +336,13 @@ const phoneFromBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || []).pop();
 const nameSaveMatch =
   /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd) ||
   /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
-console.error('fallback_contact_upsert', { contactName, phoneClean });
 // If we have both a name and a phone, save the contact now
 if (nameSaveMatch && phoneFromBody) {
   matched = true;
   const contactName = nameSaveMatch[1].trim();
   const phoneClean  = phoneFromBody.replace(/\s+/g, '');
+
+  console.error('fallback_contact_upsert', { contactName, phoneClean });
 
   const { error: cErr } = await supabase
     .from('contacts')
