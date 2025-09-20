@@ -213,9 +213,6 @@ export default async function handler(req, res) {
       return res.status(200).send('Limi webhook is alive');
     }
 
-    
-    // ------------------------------------------------------
-
     if (req.method !== 'POST') {
       return res.status(405).send('Method Not Allowed');
     }
@@ -230,12 +227,14 @@ export default async function handler(req, res) {
     const rawFrom = params.get('From') || '';
     const from = rawFrom.replace(/^whatsapp:/i, '').replace(/^sms:/i, '').trim();
     const body = (params.get('Body') || '').trim();
+
     // Normalise for command matching (strip polite openers, collapse spaces)
     const cmd = body
       .replace(/^(please|plz|hey|hi|hello|yo|limi|hey limi|hi limi)[,!\s:-]*/i, '')
       .replace(/\?+$/, '')
       .replace(/\s+/g, ' ')
       .trim();
+
     // DEBUG: confirm env + inbound payload (use error so it always shows)
     console.error('env_ok', {
       openai: !!process.env.OPENAI_KEY,
@@ -244,8 +243,8 @@ export default async function handler(req, res) {
       twilio_sid: !!process.env.TWILIO_SID,
       twilio_auth: !!process.env.TWILIO_AUTH,
       twilio_from: !!process.env.TWILIO_FROM,
-});
-    
+    });
+
     console.error('webhook_in', { from, body, cmd });
     console.error('DEBUG_CMD', { body, cmd });
     console.log('webhook START');
@@ -256,200 +255,273 @@ export default async function handler(req, res) {
 
     // Find or create user by identifier
     const { data: ident } = await supabase
-      .from('identifiers').select('user_id').eq('value', from).maybeSingle();
+      .from('identifiers')
+      .select('user_id')
+      .eq('value', from)
+      .maybeSingle();
 
     let userId = ident?.user_id;
     if (!userId) {
       const { data: user, error: userErr } = await supabase
-        .from('users').insert([{ display_name: null }]).select().single();
-      if (userErr) { console.error('user insert err', userErr); throw userErr; }
+        .from('users')
+        .insert([{ display_name: null }])
+        .select()
+        .single();
+      if (userErr) {
+        console.error('user insert err', userErr);
+        throw userErr;
+      }
       userId = user.id;
       await supabase
-        .from('identifiers').insert([{ user_id: userId, type: 'phone', value: from }]);
+        .from('identifiers')
+        .insert([{ user_id: userId, type: 'phone', value: from }]);
     }
     await dbg('user_identified', { userId, from });
-      
+
     // --- Load prior memory EARLY (some commands use it) ---
     const { data: mem } = await supabase
-      .from('memories').select('summary').eq('user_id', userId).maybeSingle();
-const prior = mem?.summary ?? blankMemory();
-const tz = prior.timezone || 'Europe/London';
+      .from('memories')
+      .select('summary')
+      .eq('user_id', userId)
+      .maybeSingle();
+    const prior = mem?.summary ?? blankMemory();
+    const tz = prior.timezone || 'Europe/London';
 
-// ---------- EARLY FALLBACK: add contact from messy phrasing ----------
-{
-  const phoneInBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
-  const directSave = /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(body);
+    // ---------- EARLY FALLBACK: add contact from messy phrasing ----------
+    {
+      const phoneInBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
+      const directSave = /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(body);
 
-  const patterns = [
-    /(?:^|\b)(?:add|save)\b[\s\S]*?(\+?\d[\d\s()+-]{6,})[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})\b/i,
-    /(?:^|\b)(?:add|save)\b[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
-    /(?:^|\b)save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
-    /(?:^|\b)(?:add|save)\b[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})[\s\S]*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
-    /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})/i,
-  ];
+      const patterns = [
+        /(?:^|\b)(?:add|save)\b[\s\S]*?(\+?\d[\d\s()+-]{6,})[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})\b/i,
+        /(?:^|\b)(?:add|save)\b[\s\S]*?\bcontact\b[\s:,-]*([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
+        /(?:^|\b)save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact[\s\S]*?(\+?\d[\d\s()+-]{6,})/i,
+        /(?:^|\b)(?:add|save)\b[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})[\s\S]*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
+        /(?:^|\b)(?:add|save)\b[\s\S]*?([a-zA-Z][a-zA-Z\s'’-]{1,40})[\s\S]*?(?:number|no\.?)\s*(\+?\d[\d\s()+-]{6,})/i,
+      ];
 
-  let rawName = null, rawPhone = null;
+      let rawName = null;
+      let rawPhone = null;
 
-  if (directSave && phoneInBody) {
-    rawName  = directSave[1];
-    rawPhone = phoneInBody;
-  } else {
-    for (const r of patterns) {
-      const m = r.exec(body);
-      if (m) {
-        if (/\d/.test(m[1])) { rawPhone = m[1]; rawName = m[2]; }
-        else { rawName = m[1]; rawPhone = m[2]; }
-        break;
+      if (directSave && phoneInBody) {
+        rawName = directSave[1];
+        rawPhone = phoneInBody;
+      } else {
+        for (const r of patterns) {
+          const m = r.exec(body);
+          if (m) {
+            if (/\d/.test(m[1])) {
+              rawPhone = m[1];
+              rawName = m[2];
+            } else {
+              rawName = m[1];
+              rawPhone = m[2];
+            }
+            break;
+          }
+        }
+        const nameSaveMatch1 =
+          /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
+        const nameSaveMatch2 =
+          /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
+        if (!rawName) rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
+        if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
+      }
+
+      // Log AFTER parsing so we can see what was found
+      await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
+
+      if (rawName && rawPhone) {
+        const contactName = titleCaseName(rawName);
+        const phoneClean = normalizeUkPhone(rawPhone);
+
+        await dbg(
+          'contact_upsert_try',
+          { source: 'fallback', name: contactName, phone: phoneClean },
+          userId
+        );
+
+        const { error: cErr } = await supabase
+          .from('contacts')
+          .upsert(
+            { user_id: userId, name: contactName, phone: phoneClean },
+            { onConflict: 'user_id,name' }
+          );
+
+        if (cErr) {
+          await dbg(
+            'contact_upsert_error',
+            { source: 'fallback', code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint },
+            userId
+          );
+          res.setHeader('Content-Type', 'text/xml');
+          return res
+            .status(200)
+            .send('<Response><Message>Could not save contact right now.</Message></Response>');
+        }
+
+        res.setHeader('Content-Type', 'text/xml');
+        return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
       }
     }
-    const nameSaveMatch1 =
-      /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
-    const nameSaveMatch2 =
-      /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
-    if (!rawName) rawName = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]) || null;
-    if (!rawPhone && phoneInBody) rawPhone = phoneInBody;
-  }
+    // ---------- END EARLY FALLBACK ----------
 
-  // Log AFTER parsing so we can see what was found
-  await dbg('contact_fallback_parsed', { rawName, rawPhone, body }, userId);
-
-  if (rawName && rawPhone) {
-    const contactName = titleCaseName(rawName);
-    const phoneClean  = normalizeUkPhone(rawPhone);
-
-    await dbg('contact_upsert_try', { source: 'fallback', name: contactName, phone: phoneClean }, userId);
-
-    const { error: cErr } = await supabase
-      .from('contacts')
-      .upsert(
-        { user_id: userId, name: contactName, phone: phoneClean },
-        { onConflict: 'user_id,name' }
-      );
-
-    if (cErr) {
-      await dbg('contact_upsert_error', {
-        source: 'fallback',
-        code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint
-      }, userId);
-
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-    }
-
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
-  }
-}
-// ---------- END EARLY FALLBACK ----------
-
-    
-// Now try the LLM router only if fallback didn’t handle it
-const intent = await routeIntent(openai, prior, body);
+    // Now try the LLM router only if fallback didn’t handle it
+    const intent = await routeIntent(openai, prior, body);
 
     console.error('intent_json', JSON.stringify(intent));
     console.error('intent_out', intent);
 
-if (intent?.action && intent.action !== 'none') {
-  const a = intent.action;
-  const p = intent.params || {};
-}
-  // ADD CONTACT: accept phone or try to find one anywhere in the raw body
-if (a === 'add_contact') {
-  const nameRaw  = (p.name || '').trim();
-  const phoneRaw = (p.phone || findPhone(body));
+    if (intent?.action && intent.action !== 'none') {
+      const a = intent.action;
+      const p = intent.params || {};
 
-  const name  = titleCaseName(nameRaw);
-  const phone = phoneRaw ? normalizeUkPhone(phoneRaw) : null;
+      // ADD CONTACT
+      if (a === 'add_contact') {
+        const nameRaw = (p.name || '').trim();
+        const phoneRaw = (p.phone || findPhone(body));
+        const name = titleCaseName(nameRaw);
+        const phone = phoneRaw ? normalizeUkPhone(phoneRaw) : null;
 
-  if (!name || !phone) {
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send('<Response><Message>I need a name and a phone to save a contact.</Message></Response>');
-  }
+        if (!name || !phone) {
+          res.setHeader('Content-Type', 'text/xml');
+          return res
+            .status(200)
+            .send('<Response><Message>I need a name and a phone to save a contact.</Message></Response>');
+        }
 
-  // NEW: log what we’ll upsert via the LLM route
-  await dbg('contact_upsert_try', { source: 'llm', name, phone }, userId);
+        await dbg('contact_upsert_try', { source: 'llm', name, phone }, userId);
 
-  const { error: cErr } = await supabase
-    .from('contacts')
-    .upsert({ user_id: userId, name, phone }, { onConflict: 'user_id,name' });
+        const { error: cErr } = await supabase
+          .from('contacts')
+          .upsert({ user_id: userId, name, phone }, { onConflict: 'user_id,name' });
 
-  if (cErr) {
-    // NEW: capture DB error
-    await dbg('contact_upsert_error', {
-      source: 'llm',
-      code: cErr.code,
-      message: cErr.message,
-      details: cErr.details,
-      hint: cErr.hint
-    }, userId);
+        if (cErr) {
+          await dbg(
+            'contact_upsert_error',
+            { source: 'llm', code: cErr.code, message: cErr.message, details: cErr.details, hint: cErr.hint },
+            userId
+          );
+          res.setHeader('Content-Type', 'text/xml');
+          return res
+            .status(200)
+            .send('<Response><Message>Could not save contact right now.</Message></Response>');
+        }
 
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
-  }
+        res.setHeader('Content-Type', 'text/xml');
+        return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
+      }
 
-  // SEND TEXT
-  if (a === 'send_text') {
-    const name = (p.name || '').trim();
-    const msg  = (p.message || '').trim();
+      // SEND TEXT
+      if (a === 'send_text') {
+        const name = (p.name || '').trim();
+        const msg = (p.message || '').trim();
 
-    if (!name || !msg) {
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>I need who to text and the message.</Message></Response>');
+        if (!name || !msg) {
+          res.setHeader('Content-Type', 'text/xml');
+          return res
+            .status(200)
+            .send('<Response><Message>I need who to text and the message.</Message></Response>');
+        }
+
+        // check credits
+        const { data: bal } = await supabase
+          .from('credits')
+          .select('balance')
+          .eq('user_id', userId)
+          .maybeSingle();
+        if (!bal || bal.balance <= 0) {
+          res.setHeader('Content-Type', 'text/xml');
+          return res
+            .status(200)
+            .send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
+        }
+
+        const { data: list } = await supabase
+          .from('contacts')
+          .select('name,phone')
+          .eq('user_id', userId);
+        const contact = (list || []).find(c => c.name.toLowerCase() === name.toLowerCase());
+
+        res.setHeader('Content-Type', 'text/xml');
+        if (!contact) {
+          return res
+            .status(200)
+            .send(
+              `<Response><Message>No contact "${name}". Try: add contact ${name} +44...</Message></Response>`
+            );
+        }
+
+        await twilioClient.messages.create({
+          to: contact.phone,
+          from: TWILIO_FROM,
+          body: msg.slice(0, 320),
+        });
+        await supabase
+          .from('messages')
+          .insert([
+            {
+              user_id: userId,
+              channel: 'sms',
+              external_id: contact.phone,
+              body: `(outbound) ${msg.slice(0, 320)}`,
+            },
+          ]);
+        await supabase
+          .from('credits')
+          .upsert({ user_id: userId, balance: bal.balance - 1 });
+
+        return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
+      }
+
+      // LINK EMAIL
+      if (a === 'link_email' && p.email) {
+        await supabase
+          .from('identifiers')
+          .upsert({ user_id: userId, type: 'email', value: p.email.toLowerCase() });
+        res.setHeader('Content-Type', 'text/xml');
+        return res.status(200).send(`<Response><Message>Linked email: ${p.email}</Message></Response>`);
+      }
+
+      // SET REMINDER
+      if (a === 'set_reminder' && p.when && p.text) {
+        const when = parseWhen(p.when, tz) || new Date(p.when);
+        if (!when || Number.isNaN(+when)) {
+          res.setHeader('Content-Type', 'text/xml');
+          return res
+            .status(200)
+            .send('<Response><Message>I couldn’t parse the time.</Message></Response>');
+        }
+        await supabase
+          .from('reminders')
+          .insert({
+            user_id: userId,
+            text: p.text,
+            run_at: when.toISOString(),
+            tz,
+            status: 'scheduled',
+          });
+        res.setHeader('Content-Type', 'text/xml');
+        return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
+      }
+
+      // If we had an action but missing bits, fall through to later logic…
     }
 
-    // check credits
-    const { data: bal } = await supabase.from('credits').select('balance').eq('user_id', userId).maybeSingle();
-    if (!bal || bal.balance <= 0) {
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
+    // BUY keyword
+    if (/^buy\b/i.test(cmd)) {
+      res.setHeader('Content-Type', 'text/xml');
+      return res
+        .status(200)
+        .send('<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>');
     }
 
-    const { data: list } = await supabase.from('contacts').select('name,phone').eq('user_id', userId);
-    const contact = (list || []).find(c => c.name.toLowerCase() === name.toLowerCase());
-
-    res.setHeader('Content-Type','text/xml');
-    if (!contact) {
-      return res.status(200).send(`<Response><Message>No contact "${name}". Try: add contact ${name} +44...</Message></Response>`);
-    }
-
-    await twilioClient.messages.create({ to: contact.phone, from: TWILIO_FROM, body: msg.slice(0,320) });
-    await supabase.from('messages').insert([{ user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }]);
-    await supabase.from('credits').upsert({ user_id: userId, balance: (bal.balance - 1) });
-
-    return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
-  }
-
-  // LINK EMAIL
-  if (a === 'link_email' && p.email) {
-    await supabase.from('identifiers').upsert({ user_id: userId, type: 'email', value: p.email.toLowerCase() });
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send(`<Response><Message>Linked email: ${p.email}</Message></Response>`);
-  }
-
-  // SET REMINDER
-  if (a === 'set_reminder' && p.when && p.text) {
-    const when = parseWhen(p.when, tz) || new Date(p.when);
-    if (!when || Number.isNaN(+when)) {
-      res.setHeader('Content-Type','text/xml');
-      return res.status(200).send('<Response><Message>I couldn’t parse the time.</Message></Response>');
-    }
-    await supabase.from('reminders').insert({ user_id: userId, text: p.text, run_at: when.toISOString(), tz, status: 'scheduled' });
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
-  }
-
-  // If we had an action but missing bits, fall through to regex fallback next.
-}
-
-    
-if (/^buy\b/i.test(cmd)) {
-  res.setHeader('Content-Type', 'text/xml');
-  return res.status(200)
-    .send('<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>');
-}
     // --- Credits (simple) ---
     const { data: bal } = await supabase
-      .from('credits').select('balance').eq('user_id', userId).maybeSingle();
+      .from('credits')
+      .select('balance')
+      .eq('user_id', userId)
+      .maybeSingle();
 
     if (!bal || bal.balance <= 0) {
       res.setHeader('Content-Type', 'text/xml');
@@ -458,10 +530,7 @@ if (/^buy\b/i.test(cmd)) {
         .send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
     }
 
-
-    
     // ---- AI flow (also charges a credit) ----
-
     // Extract & merge memory
     const extracted = await extractMemory(openai, prior, body);
     const summary = mergeMemory(prior, extracted);
@@ -471,7 +540,8 @@ if (/^buy\b/i.test(cmd)) {
 
     // Log inbound message
     await supabase
-      .from('messages').insert([{ user_id: userId, channel: 'sms', external_id: from, body }]);
+      .from('messages')
+      .insert([{ user_id: userId, channel: 'sms', external_id: from, body }]);
 
     // Decrement credits for this AI turn
     const newBal = (bal?.balance ?? 1) - 1;
@@ -481,14 +551,16 @@ if (/^buy\b/i.test(cmd)) {
     const replyComp = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system',
+        {
+          role: 'system',
           content:
-            'You are Limi. Use memory (name, location, email, birthday, timezone, preferences, interests, goals, notes). Keep replies under 120 characters unless asked for detail.' },
+            'You are Limi. Use memory (name, location, email, birthday, timezone, preferences, interests, goals, notes). Keep replies under 120 characters unless asked for detail.',
+        },
         { role: 'user', content: `Memory: ${JSON.stringify(summary)}` },
-        { role: 'user', content: `User: ${body}` }
+        { role: 'user', content: `User: ${body}` },
       ],
       temperature: 0.5,
-      max_tokens: 80
+      max_tokens: 80,
     });
     const reply = replyComp.choices[0].message.content?.trim() || 'OK';
 
@@ -499,11 +571,12 @@ if (/^buy\b/i.test(cmd)) {
     // Respond as TwiML
     res.setHeader('Content-Type', 'text/xml');
     return res.status(200).send(`<Response><Message>${reply}</Message></Response>`);
-
   } catch (e) {
     console.error('handler fatal', e);
     res.setHeader('Content-Type', 'text/xml');
-    return res.status(200).send('<Response><Message>Sorry, something went wrong.</Message></Response>');
+    return res
+      .status(200)
+      .send('<Response><Message>Sorry, something went wrong.</Message></Response>');
   }
 }
 
