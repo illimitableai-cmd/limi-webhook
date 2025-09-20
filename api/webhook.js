@@ -87,7 +87,45 @@ New user message: "${newMessage}"`;
 }
 async function routeIntent(openaiClient, prior, text) {
   const sys = `You are an intent router for an SMS assistant (Limi).
-Return ONLY compact JSON (no prose).
+Return ONLY compact JSON.
+
+type Output = {
+  action: "add_contact" | "send_text" | "set_reminder" | "link_email" | "none",
+  params?: {
+    name?: string,       // contact full name if any words look like a human name
+    phone?: string,      // any phone-like string you can find in the text
+    message?: string,    // message text for send_text
+    when?: string,       // natural time
+    email?: string
+  }
+};
+
+Rules:
+- Understand messy, natural language (any order): e.g. "add 07755... as a contact Ashley Leggett", 
+  "save this number under Ashley", "add Ashley Leggett, number 07755...", etc.
+- If a phone is present in the message anywhere, put it in params.phone exactly as seen.
+- If a human name is present anywhere, put it in params.name (keep it short, capitalized).
+- For send_text, infer params.name and params.message from any order ("text Ashley: running late").
+- If you can’t infer enough for a confident action, return { "action": "none" }. No explanations.`;
+
+  const user = `Prior memory (may help with names): ${JSON.stringify(prior || {})}
+Message: ${text}`;
+
+  const comp = await openaiClient.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    temperature: 0,
+    max_tokens: 180
+  });
+
+  try {
+    const t = comp.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+  } catch {
+    return { action: "none" };
+  }
+}
 
 type Output = {
   action: "add_contact" | "send_text" | "set_reminder" | "link_email" | "none";
@@ -127,6 +165,13 @@ function parseWhen(str, tzGuess = "Europe/London") {
   // very lightweight: “tomorrow 08:00”, “in 2 hours”, “2025-12-24 17:00”
   const now = new Date();
   const lower = (str || "").toLowerCase().trim();
+
+  // Pull a phone from any messy text; returns digits with leading +
+function findPhone(str='') {
+  const m = str.match(/(\+?\d[\d\s()+-]{6,})/);
+  if (!m) return null;
+  return m[1].replace(/\s+/g, '');
+}
 
   // ISO-like
   const iso = lower.match(/\d{4}-\d{2}-\d{2}(\s+|\s*at\s*)(\d{1,2}:\d{2})/);
@@ -215,6 +260,93 @@ console.error('webhook_in', { from, body, cmd });
       .from('memories').select('summary').eq('user_id', userId).maybeSingle();
     const prior = mem?.summary ?? blankMemory();
     const tz = prior.timezone || 'Europe/London';
+
+// --- LLM FIRST: try to understand any natural phrasing ---
+const intent = await routeIntent(openai, prior, body);
+console.error('intent_out', intent);
+
+if (intent?.action && intent.action !== 'none') {
+  const a = intent.action;
+  const p = intent.params || {};
+
+  // ADD CONTACT: accept phone or try to find one anywhere in the raw body
+  if (a === 'add_contact') {
+    const name  = (p.name || '').trim();
+    const phone = (p.phone || findPhone(body));
+
+    if (!name || !phone) {
+      res.setHeader('Content-Type','text/xml');
+      return res.status(200).send('<Response><Message>I need a name and a phone to save a contact.</Message></Response>');
+    }
+
+    const { error: cErr } = await supabase
+      .from('contacts')
+      .upsert({ user_id: userId, name, phone: phone.replace(/\s+/g,'') }, { onConflict: 'user_id,name' });
+
+    res.setHeader('Content-Type','text/xml');
+    if (cErr) {
+      console.error('contacts upsert error', cErr);
+      return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+    }
+    return res.status(200).send(`<Response><Message>Saved ${name}</Message></Response>`);
+  }
+
+  // SEND TEXT
+  if (a === 'send_text') {
+    const name = (p.name || '').trim();
+    const msg  = (p.message || '').trim();
+
+    if (!name || !msg) {
+      res.setHeader('Content-Type','text/xml');
+      return res.status(200).send('<Response><Message>I need who to text and the message.</Message></Response>');
+    }
+
+    // check credits
+    const { data: bal } = await supabase.from('credits').select('balance').eq('user_id', userId).maybeSingle();
+    if (!bal || bal.balance <= 0) {
+      res.setHeader('Content-Type','text/xml');
+      return res.status(200).send('<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>');
+    }
+
+    const { data: list } = await supabase.from('contacts').select('name,phone').eq('user_id', userId);
+    const contact = (list || []).find(c => c.name.toLowerCase() === name.toLowerCase());
+
+    res.setHeader('Content-Type','text/xml');
+    if (!contact) {
+      return res.status(200).send(`<Response><Message>No contact "${name}". Try: add contact ${name} +44...</Message></Response>`);
+    }
+
+    await twilioClient.messages.create({ to: contact.phone, from: TWILIO_FROM, body: msg.slice(0,320) });
+    await supabase.from('messages').insert([{ user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }]);
+    await supabase.from('credits').upsert({ user_id: userId, balance: (bal.balance - 1) });
+
+    return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
+  }
+
+  // LINK EMAIL
+  if (a === 'link_email' && p.email) {
+    await supabase.from('identifiers').upsert({ user_id: userId, type: 'email', value: p.email.toLowerCase() });
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send(`<Response><Message>Linked email: ${p.email}</Message></Response>`);
+  }
+
+  // SET REMINDER
+  if (a === 'set_reminder' && p.when && p.text) {
+    const when = parseWhen(p.when, tz) || new Date(p.when);
+    if (!when || Number.isNaN(+when)) {
+      res.setHeader('Content-Type','text/xml');
+      return res.status(200).send('<Response><Message>I couldn’t parse the time.</Message></Response>');
+    }
+    await supabase.from('reminders').insert({ user_id: userId, text: p.text, run_at: when.toISOString(), tz, status: 'scheduled' });
+    res.setHeader('Content-Type','text/xml');
+    return res.status(200).send('<Response><Message>Reminder set.</Message></Response>');
+  }
+
+  // If we had an action but missing bits, fall through to regex fallback next.
+}
+
+
+
 // ----- TEMP FALLBACK: contacts + send text (robust) -----
 /**
  * We parse name and phone separately so it also works when there's no space
