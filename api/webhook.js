@@ -1,4 +1,4 @@
-// Outbound SMS setup
+  // Outbound SMS setup
 import twilio from 'twilio';
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 const TWILIO_FROM = process.env.TWILIO_FROM; // e.g. +4477...
@@ -234,6 +234,20 @@ console.error('webhook_in', { from, body, cmd });
     const prior = mem?.summary ?? blankMemory();
     const tz = prior.timezone || 'Europe/London';
 
+    console.error('debug_body_cmd', { body, cmd });
+
+    const phoneFromBody = (body.match(/(\+?\d[\d\s()+-]{6,})/g) || []).pop();
+    console.error('debug_phoneFromBody', { phoneFromBody });
+
+    const nameSaveMatch1 =
+      /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd);
+    const nameSaveMatch2 =
+      /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
+    console.error('debug_nameSaveMatch', {
+      nameSaveMatch1: nameSaveMatch1 && nameSaveMatch1[1],
+      nameSaveMatch2: nameSaveMatch2 && nameSaveMatch2[1]
+});
+
 // --- LLM FIRST: try to understand any natural phrasing ---
 const intent = await routeIntent(openai, prior, body);
     console.error('intent_json', JSON.stringify(intent));
@@ -337,6 +351,46 @@ const nameSaveMatch =
   /(?:^| )(?:add|save)\s+(?:a\s+)?contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})(?:\b|$)/i.exec(cmd) ||
   /(?:^| )(?:can you|please)?\s*save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact\b/i.exec(cmd);
 // If we have both a name and a phone, save the contact now
+    // EXTRA "any order" patterns:
+const anyOrder1 = /(?:^|\b)(?:add|save)\b.*?(\+?\d[\d\s()+-]{6,}).*?\bcontact\b.*?([a-zA-Z][a-zA-Z\s'’-]{1,40})/i.exec(body);
+const anyOrder2 = /(?:^|\b)(?:add|save)\b.*?\b(?:under|for)\b\s+([a-zA-Z][a-zA-Z\s'’-]{1,40}).*?(\+?\d[\d\s()+-]{6,})/i.exec(body);
+
+let fallbackName = null;
+let fallbackPhone = null;
+
+if (anyOrder1) {
+  fallbackPhone = anyOrder1[1];
+  fallbackName  = anyOrder1[2];
+} else if (anyOrder2) {
+  fallbackName  = anyOrder2[1];
+  fallbackPhone = anyOrder2[2];
+} else if ((nameSaveMatch1 || nameSaveMatch2) && phoneFromBody) {
+  fallbackName  = (nameSaveMatch1?.[1] || nameSaveMatch2?.[1]);
+  fallbackPhone = phoneFromBody;
+}
+
+if (fallbackName && fallbackPhone) {
+  const contactName = fallbackName.trim().replace(/\s+/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase()); // nice capitalization
+  const phoneClean  = fallbackPhone.replace(/\s+/g, '');
+
+  console.error('fallback_contact_upsert', { contactName, phoneClean });
+
+  const { error: cErr } = await supabase
+    .from('contacts')
+    .upsert(
+      { user_id: userId, name: contactName, phone: phoneClean },
+      { onConflict: 'user_id,name' }
+    );
+
+  res.setHeader('Content-Type','text/xml');
+  if (cErr) {
+    console.error('contacts upsert error', cErr);
+    return res.status(200).send('<Response><Message>Could not save contact right now.</Message></Response>');
+  }
+  return res.status(200).send(`<Response><Message>Saved ${contactName}</Message></Response>`);
+}
+
 if (nameSaveMatch && phoneFromBody) {
   matched = true;
   const contactName = nameSaveMatch[1].trim();
