@@ -140,6 +140,19 @@ function findPhone(str='') {
   if (!m) return null;
   return m[1].replace(/\s+/g, '');
 }
+// Normalize UK phones to +44 format
+function normalizeUkPhone(p) {
+  const d = p.replace(/\s+/g,'');
+  if (d.startsWith('+')) return d;
+  if (d.startsWith('07')) return '+44' + d.slice(1);
+  return d; // leave others unchanged
+}
+
+// Title-case a name (Louise Hart instead of louise hart)
+function titleCaseName(n='') {
+  return n.trim().replace(/\s+/g,' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
 // quick iso-ish parser for common natural "when" phrases
 function parseWhen(str, tzGuess = "Europe/London") {
   // very lightweight: “tomorrow 08:00”, “in 2 hours”, “2025-12-24 17:00”
