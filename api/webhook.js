@@ -281,34 +281,6 @@ if (m) {
 }
 // ----- END TEMP FALLBACK -----
 
-if (m) {
-  const [, nameRaw, msg] = m;
-  const name = nameRaw.trim().toLowerCase();
-  const { data: list } = await supabase
-    .from('contacts').select('name,phone').eq('user_id', userId);
-  const contact = (list || []).find(c => c.name.toLowerCase() === name);
-
-  if (!contact) {
-    res.setHeader('Content-Type','text/xml');
-    return res.status(200).send(
-      `<Response><Message>No contact "${nameRaw}". Try: add contact ${nameRaw} +44...</Message></Response>`
-    );
-  }
-
-  // Twilio trial can only send to verified numbers
-  await twilioClient.messages.create({
-    to: contact.phone, from: TWILIO_FROM, body: msg.slice(0, 320)
-  });
-
-  await supabase.from('messages').insert([
-    { user_id: userId, channel: 'sms', external_id: contact.phone, body: `(outbound) ${msg.slice(0,320)}` }
-  ]);
-
-  res.setHeader('Content-Type','text/xml');
-  return res.status(200).send(`<Response><Message>Sent to ${contact.name}</Message></Response>`);
-}
-// ----- END TEMP FALLBACK -----
-
 // --- Intent routing (LLM decides action) ---
 const intent = await routeIntent(openai, prior, body);
 console.error('intent_out', intent);
