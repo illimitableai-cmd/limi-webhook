@@ -124,7 +124,6 @@ if (req.method === "GET") {
   await dbg("ping", { at: new Date().toISOString() });
   return res.status(200).send("ping logged");
 }
-    }
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
     // parse body
