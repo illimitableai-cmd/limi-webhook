@@ -15,12 +15,23 @@ const TWILIO_FROM = process.env.TWILIO_FROM;
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 
-async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.4, max_tokens = 180 }) {
+/** Unified completion helper: GPT-5 uses max_completion_tokens; older models use max_tokens */
+async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.4, maxTokens = 180 }) {
+  const args = { model, messages, temperature };
+  if (/^gpt-5/i.test(model)) args.max_completion_tokens = maxTokens;
+  else args.max_tokens = maxTokens;
+
   try {
-    return await openai.chat.completions.create({ model, messages, temperature, max_tokens });
+    return await openai.chat.completions.create(args);
   } catch (err) {
     await dbg("model_fallback", { tried: model, error: String(err) });
-    return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature, max_tokens });
+    // Fallback uses legacy max_tokens
+    return await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    });
   }
 }
 
@@ -28,7 +39,7 @@ function escapeXml(s = "") {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// UPDATED: normalize to canonical E.164 so SMS & WhatsApp map to the same user
+// Normalize to canonical E.164 so SMS & WhatsApp map to the same user
 function uidFromTwilio(from = "") {
   let v = from.replace(/^whatsapp:/i, "").replace(/^sms:/i, "").trim();
   v = v.replace(/[^\d+]/g, "");        // strip spaces, -, ()
@@ -84,7 +95,7 @@ async function extractMemory(prior, newMsg) {
     model: MEMORY_MODEL,
     messages: [{ role: "system", content: sys }, { role: "user", content: user }],
     temperature: 0.2,
-    max_tokens: 180,
+    maxTokens: 180,
   });
   try {
     const t = c.choices[0].message.content || "{}";
@@ -335,7 +346,7 @@ async function llmExtractContact(msg) {
     model: MEMORY_MODEL,
     messages: [{ role: "system", content: sys }, { role: "user", content: user }],
     temperature: 0,
-    max_tokens: 80
+    maxTokens: 80
   });
   try {
     const t = c.choices[0].message.content || "{}";
@@ -419,6 +430,31 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
+    // --- QUICK CONTACT LIST (no credits, no model) ---
+    if (/^\s*(contacts|contact\s+list|show\s+contacts|my\s+contacts)\s*$/i.test(body)) {
+      const { data: contacts, error: listErr } = await supabase
+        .from("contacts")
+        .select("name, phone")
+        .eq("user_id", userId)
+        .order("name", { ascending: true })
+        .limit(100);
+
+      let msg = "No contacts saved yet.";
+      if (!listErr && Array.isArray(contacts) && contacts.length) {
+        const lines = contacts.map(c => `${c.name} — ${c.phone}`);
+        msg = lines.join("\n");
+      } else if (listErr) {
+        await dbg("contacts_list_error", { code: listErr.code, message: listErr.message }, userId);
+        msg = "Sorry, couldn't fetch contacts right now.";
+      }
+
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+
+      res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
     // FAST PATH: save contact intent (no credits, no memory change)
     let contact = parseSaveContact(body);
     if (!contact) {
@@ -466,7 +502,7 @@ export default async function handler(req, res) {
         const mediaUrl = p.get("MediaUrl0");
         const ctype = p.get("MediaContentType0") || "image/jpeg";
         const b64 = await fetchTwilioMediaB64(mediaUrl);
-        // UPDATED: use "image_url" (supported) instead of "input_image"
+        // Use "image_url" (supported) instead of "input_image"
         visionPart = { type: "image_url", image_url: { url: `data:${ctype};base64,${b64}` } };
         if (!userMsg) userMsg = "Please analyse this image.";
       } catch (err) {
@@ -489,7 +525,7 @@ export default async function handler(req, res) {
       model: CHAT_MODEL,
       messages,
       temperature: 0.4,
-      max_tokens: 180,
+      maxTokens: 180,
     });
     const reply = completion.choices[0].message.content?.trim() || "OK";
 
