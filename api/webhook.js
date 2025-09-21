@@ -14,6 +14,9 @@ const TWILIO_FROM = process.env.TWILIO_FROM;
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 
+// FREE TRIAL amount used when we first see a user with no credits row
+const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
+
 /** GPT-5: use max_completion_tokens and omit temperature; others use legacy params */
 async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.4, maxTokens = 180 }) {
   const isGpt5 = /^gpt-5/i.test(model);
@@ -245,6 +248,36 @@ async function setCredits(userId, balance) {
   await supabase.from("credits").upsert({ user_id: userId, balance });
 }
 
+/* === NEW: ensure a credits row exists, seed if missing === */
+async function ensureCredits(userId) {
+  const { data, error } = await supabase
+    .from("credits")
+    .select("balance")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    await dbg("credits_select_error", { code: error.code, message: error.message }, userId);
+  }
+
+  if (!data) {
+    const { error: insErr } = await supabase
+      .from("credits")
+      .insert([{ user_id: userId, balance: FREE_TRIAL_CREDITS }]);
+
+    if (insErr) {
+      await dbg("credits_insert_error", { code: insErr.code, message: insErr.message }, userId);
+      // Fall back to treating as zero if insert fails
+      return 0;
+    }
+
+    await dbg("credits_seeded", { seeded: FREE_TRIAL_CREDITS }, userId);
+    return FREE_TRIAL_CREDITS;
+  }
+
+  return data.balance ?? 0;
+}
+
 /** -------- Contact parsing + LLM fallback -------- */
 function parseSaveContact(msg) {
   const text = (msg || "").trim();
@@ -357,9 +390,11 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>");
     }
 
+    // Ensure we have a user row
     const userId = await getOrCreateUserId(from);
     await dbg("user_identified", { userId, from }, userId);
 
+    // Save WA profile as a contact on first touch
     if (waProfile) {
       await upsertContact({ userId, name: sanitizeName(waProfile), phone: from, channel });
     }
@@ -382,7 +417,6 @@ export default async function handler(req, res) {
       if (!listErr && Array.isArray(contacts) && contacts.length) {
         const rows = contacts.map(c => {
           const name  = sanitizeName(c.name || "");
-          // show compact E.164 (no spaces), heal local UK numbers to +44
           const phone = normalizePhone(c.phone || "");
           return `- ${name}: ${phone}`;
         });
@@ -398,7 +432,7 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // ---- FAST contact save (regex + LLM fallback) ----
+    // ---- FAST contact save (regex + LLM fallback)
     let contact = parseSaveContact(body);
     if (!contact) {
       try {
@@ -417,14 +451,14 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
     }
 
-    // ---- credits gate ----
-    const credits = await getCredits(userId);
+    // === CREDITS GATE (auto-seed if missing) ===
+    const credits = await ensureCredits(userId); // <-- ensures row exists
     if (credits <= 0) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
     }
 
-    // ---- memory + media ----
+    // ---- memory + media
     const { data: memRow } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
     const prior = memRow?.summary ?? blankMemory();
 
@@ -460,6 +494,7 @@ export default async function handler(req, res) {
     const reply = completion.choices[0].message.content?.trim() || "OK";
 
     await saveTurn(userId, "assistant", reply, channel, from);
+    // simple debit (MVP): reduce by 1
     await setCredits(userId, Math.max(0, credits - 1));
 
     const extracted = await extractMemory(prior, body);
