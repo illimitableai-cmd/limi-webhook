@@ -360,6 +360,25 @@ function isContactListQuery(text = "") {
   );
 }
 
+/* -------- QUICK NAME EXTRACTOR (no model) -------- */
+function extractNameQuick(text = "") {
+  const t = (text || "").trim();
+  const patterns = [
+    /\bmy\s+name\s+is\s+([a-z][a-z\s'’-]{2,60})$/i,
+    /\bit['’]s\s+([a-z][a-z\s'’-]{2,60})$/i,
+    /\bi['’]m\s+([a-z][a-z\s'’-]{2,60})$/i,
+    /\bi\s+am\s+([a-z][a-z\s'’-]{2,60})$/i,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m && m[1]) {
+      const name = sanitizeName(m[1]);
+      if (!isBadName(name)) return name;
+    }
+  }
+  return null;
+}
+
 // ===================================================================
 export default async function handler(req, res) {
   try {
@@ -404,6 +423,35 @@ export default async function handler(req, res) {
     if (/^buy\b/i.test(body)) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
+    }
+
+    // --- QUICK NAME SAVE (no model, no credits) ---
+    const quickName = extractNameQuick(body);
+    if (quickName) {
+      const { data: memRow0 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
+      const prior0 = memRow0?.summary ?? blankMemory();
+      const merged0 = mergeMemory(prior0, { name: quickName });
+      await supabase.from("memories").upsert({ user_id: userId, summary: merged0 });
+      await upsertContact({ userId, name: quickName, phone: from, channel });
+
+      const ack = `Nice to meet you, ${quickName}. I’ll remember that.`;
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", ack, channel, from);
+
+      res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(ack)}</Message></Response>`);
+    }
+
+    // --- "WHAT IS MY NAME?" quick answer (no model, no credits) ---
+    if (/^\s*what('?| i)?s?\s+my\s+name\??\s*$/i.test(body) || /^\s*what\s+is\s+my\s+name\??\s*$/i.test(body)) {
+      const { data: memRow1 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
+      const name = memRow1?.summary?.name;
+      const msg = name ? `Your name is ${name}.` : `I don’t have your name yet. What’s your first name so I can save it?`;
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+
+      res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
     // ---- CONTACT LIST quick path (no model, no credits)
