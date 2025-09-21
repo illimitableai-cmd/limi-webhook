@@ -125,7 +125,7 @@ if (req.method === "GET") {
   return res.status(200).send("ping logged");
 }
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
-
+}
     // parse body
     const chunks=[]; for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
