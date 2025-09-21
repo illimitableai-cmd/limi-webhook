@@ -198,6 +198,26 @@ function prettyPhone(p = "") {
   return `+${cc} ${chunks.reverse().join(" ")}`;
 }
 
+/* ---------- DIRECT SEND HELPER (new) ---------- */
+async function sendDirect({ channel, to, body }) {
+  try {
+    if (channel === "whatsapp") {
+      const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
+      const waTo   = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+      const r = await twilioClient.messages.create({ from: waFrom, to: waTo, body });
+      await dbg("direct_send_ok", { channel, sid: r.sid, to }, null);
+      return true;
+    } else {
+      const r = await twilioClient.messages.create({ from: TWILIO_FROM, to, body });
+      await dbg("direct_send_ok", { channel, sid: r.sid, to }, null);
+      return true;
+    }
+  } catch (e) {
+    await dbg("direct_send_error", { channel, to, message: String(e?.message || e) }, null);
+    return false;
+  }
+}
+
 // ---- contacts helper ----
 async function upsertContact({ userId, name, phone, channel }) {
   const tidyIncoming = sanitizeName(name);
@@ -666,7 +686,7 @@ export default async function handler(req, res) {
 
     /* ==================== EMERGENCY: natural-language router (free) ==================== */
     const emgNLU = await emgExtractNatural(body);
-    await dbg("emg_nlu", emgNLU, userId); // <--- log what NLU extracted
+    await dbg("emg_nlu", emgNLU, userId); // log what NLU extracted
 
     if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
       if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
@@ -684,8 +704,9 @@ export default async function handler(req, res) {
           : "Sorry, I couldn't save that emergency contact.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
+        await sendDirect({ channel, to: from, body: msg });
         res.setHeader("Content-Type","text/xml");
-        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+        return res.status(200).send("<Response/>");
       }
 
       if (emgNLU.intent === "remove" && emgNLU.name) {
@@ -694,8 +715,9 @@ export default async function handler(req, res) {
                        : "Sorry, I couldn't remove that emergency contact.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
+        await sendDirect({ channel, to: from, body: msg });
         res.setHeader("Content-Type","text/xml");
-        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+        return res.status(200).send("<Response/>");
       }
 
       if (emgNLU.intent === "list") {
@@ -705,22 +727,24 @@ export default async function handler(req, res) {
           : "You have no emergency contacts yet. You can say things like “add my mum to my emergency contacts, 07123 456789”.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
+        await sendDirect({ channel, to: from, body: msg });
         res.setHeader("Content-Type","text/xml");
-        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+        return res.status(200).send("<Response/>");
       }
     }
 
     // --- Emergency power-user regex (still supported)
     const addEmg = parseAddEmergency(body);
     if (addEmg) {
-      await dbg("emg_upsert_req", addEmg, userId); // <--- visibility when regex path hits
+      await dbg("emg_upsert_req", addEmg, userId);
       const r = await upsertEmergencyContact({ userId, ...addEmg });
       const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`)
                        : "Sorry, I couldn't save that emergency contact.";
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
       res.setHeader("Content-Type","text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      return res.status(200).send("<Response/>");
     }
 
     const remEmg = parseRemoveEmergency(body);
@@ -729,8 +753,9 @@ export default async function handler(req, res) {
       const msg = ok ? `Removed emergency contact: ${remEmg}.` : "Sorry, I couldn't remove that emergency contact.";
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
       res.setHeader("Content-Type","text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      return res.status(200).send("<Response/>");
     }
 
     if (isEmergencyList(body)) {
@@ -740,8 +765,24 @@ export default async function handler(req, res) {
         : "You have no emergency contacts yet. Add one like: add emergency contact Alex +447700900000 sms";
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
       res.setHeader("Content-Type","text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      return res.status(200).send("<Response/>");
+    }
+
+    // HELP trigger (send alert)
+    if (isHelpTrigger(body)) {
+      const result = await sendEmergencyAlert({ userId, from });
+      let msg = "";
+      if (result.ok) msg = `Alert sent to ${result.count} emergency contact(s).`;
+      else if (result.reason === "cooldown") msg = "Emergency alert was just sent. Please wait a moment before sending another.";
+      else if (result.reason === "no_contacts") msg = "You have no emergency contacts yet. Add one first: add emergency contact Alex +447700900000";
+      else msg = "Sorry, I couldn't send the alert right now.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response/>");
     }
 
     // ---- CONTACT LIST quick path (no model, no credits)
