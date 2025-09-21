@@ -387,12 +387,132 @@ function extractNameQuick(text = "") {
       if (!isBadName(name)) return name;
     }
   }
-  // bare name like "Ashley" or "Ashley Leggett"
   if (isLikelyName(t)) {
     const name = sanitizeName(t);
     if (!isBadName(name)) return name;
   }
   return null;
+}
+
+/* ===================== EMERGENCY CONTACTS ===================== */
+async function listEmergencyContacts(userId) {
+  const { data, error } = await supabase
+    .from("emergency_contacts")
+    .select("name, phone, channel")
+    .eq("user_id", userId)
+    .order("name", { ascending: true });
+  if (error) { await dbg("emg_list_error", { code: error.code, msg: error.message }, userId); }
+  return data || [];
+}
+
+async function upsertEmergencyContact({ userId, name, phone, channel = "both" }) {
+  const tidyName = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
+  const { data: existing } = await supabase
+    .from("emergency_contacts")
+    .select("id,name,phone,channel")
+    .eq("user_id", userId)
+    .ilike("name", tidyName);
+
+  const row = (existing || []).find(r => (r.name || "").trim().toLowerCase() === tidyName.toLowerCase());
+  if (row) {
+    const { error } = await supabase
+      .from("emergency_contacts")
+      .update({ phone: normPhone, channel })
+      .eq("id", row.id);
+    if (error) { await dbg("emg_update_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
+    return { ok:true, action:"update" };
+  } else {
+    const { error } = await supabase
+      .from("emergency_contacts")
+      .insert({ user_id: userId, name: tidyName, phone: normPhone, channel });
+    if (error) { await dbg("emg_insert_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
+    return { ok:true, action:"insert" };
+  }
+}
+
+async function removeEmergencyContact(userId, name) {
+  const tidy = sanitizeName(name);
+  const { error } = await supabase
+    .from("emergency_contacts")
+    .delete()
+    .eq("user_id", userId)
+    .ilike("name", tidy);
+  if (error) { await dbg("emg_remove_error", { code: error.code, msg: error.message }, userId); return false; }
+  return true;
+}
+
+// 2-minute cooldown using debug_logs
+async function canSendAlert(userId) {
+  const twoMinAgo = new Date(Date.now() - 2*60*1000).toISOString();
+  const { data } = await supabase
+    .from("debug_logs")
+    .select("created_at")
+    .eq("user_id", userId)
+    .eq("step", "emg_alert_sent")
+    .gte("created_at", twoMinAgo)
+    .limit(1);
+  return !(data && data.length);
+}
+
+async function sendEmergencyAlert({ userId, from }) {
+  const allowed = await canSendAlert(userId);
+  if (!allowed) return { ok:false, reason:"cooldown" };
+
+  const contacts = await listEmergencyContacts(userId);
+  if (!contacts.length) return { ok:false, reason:"no_contacts" };
+
+  const msg = "⚠️ EMERGENCY ALERT\nThis is an automated message from Limi.\nPlease try to contact this number: " + from;
+
+  const tasks = [];
+  for (const c of contacts) {
+    const to = normalizePhone(c.phone);
+    const via = (c.channel || "both").toLowerCase();
+
+    // SMS
+    if (via === "sms" || via === "both") {
+      tasks.push(twilioClient.messages.create({ from: TWILIO_FROM, to, body: msg }));
+    }
+    // WhatsApp (ensure from/to use whatsapp:)
+    if (via === "whatsapp" || via === "both") {
+      const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
+      const waTo   = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+      tasks.push(twilioClient.messages.create({ from: waFrom, to: waTo, body: msg }));
+    }
+  }
+
+  try {
+    await Promise.allSettled(tasks);
+    await dbg("emg_alert_sent", { count: contacts.length }, userId);
+    return { ok:true, count: contacts.length };
+  } catch (e) {
+    await dbg("emg_alert_error", { message: String(e) }, userId);
+    return { ok:false, reason:"twilio_error" };
+  }
+}
+
+/* ---- emergency command parsing ---- */
+function parseAddEmergency(text="") {
+  // e.g., "add emergency contact John +447... [sms|whatsapp|both]"
+  const re = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
+  const m = text.trim().match(re);
+  if (!m) return null;
+  const name = sanitizeName(m[1]);
+  const phone = normalizePhone(m[2]);
+  const channel = (m[3] || "both").toLowerCase();
+  if (isBadName(name)) return null;
+  return { name, phone, channel };
+}
+function parseRemoveEmergency(text="") {
+  const re = /(?:remove|delete)\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})$/i;
+  const m = text.trim().match(re);
+  return m ? sanitizeName(m[1]) : null;
+}
+function isEmergencyList(text="") {
+  return /^\s*emergency\s+contacts\s*$/i.test(text);
+}
+function isHelpTrigger(text="") {
+  return /^\s*help!?$/i.test(text);
 }
 
 // ===================================================================
@@ -444,7 +564,6 @@ export default async function handler(req, res) {
     // --- QUICK NAME SAVE (no model, no credits) ---
     const quickName = extractNameQuick(body);
     if (quickName) {
-      // only save if we don't already have a name
       const { data: memRow0 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
       const hasName = !!memRow0?.summary?.name;
       if (!hasName) {
@@ -471,6 +590,57 @@ export default async function handler(req, res) {
       await saveTurn(userId, "assistant", msg, channel, from);
 
       res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    /* ==================== EMERGENCY COMMANDS (free) ==================== */
+
+    // add emergency contact
+    const addEmg = parseAddEmergency(body);
+    if (addEmg) {
+      const r = await upsertEmergencyContact({ userId, ...addEmg });
+      const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`)
+                       : "Sorry, I couldn't save that emergency contact.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    // remove emergency contact
+    const remEmg = parseRemoveEmergency(body);
+    if (remEmg) {
+      const ok = await removeEmergencyContact(userId, remEmg);
+      const msg = ok ? `Removed emergency contact: ${remEmg}.` : "Sorry, I couldn't remove that emergency contact.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    // list emergency contacts
+    if (isEmergencyList(body)) {
+      const list = await listEmergencyContacts(userId);
+      const msg = list.length
+        ? "🚨 Emergency Contacts:\n" + list.map(c => `- ${sanitizeName(c.name)}: ${normalizePhone(c.phone)} (${c.channel||'both'})`).join("\n")
+        : "You have no emergency contacts yet. Add one like: add emergency contact Alex +447700900000 sms";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    // HELP trigger
+    if (isHelpTrigger(body)) {
+      const result = await sendEmergencyAlert({ userId, from });
+      let msg = "";
+      if (result.ok) msg = `Alert sent to ${result.count} emergency contact(s).`;
+      else if (result.reason === "cooldown") msg = "Emergency alert was just sent. Please wait a moment before sending another.";
+      else if (result.reason === "no_contacts") msg = "You have no emergency contacts yet. Add one first: add emergency contact Alex +447700900000";
+      else msg = "Sorry, I couldn't send the alert right now.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      res.setHeader("Content-Type","text/xml");
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
@@ -553,7 +723,6 @@ export default async function handler(req, res) {
     await saveTurn(userId, "user", userMsg, channel, from);
 
     const history = cleanHistory(await loadRecentTurns(userId, 12));
-    // Use a string unless we actually have an image
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
 
     const messages = [
@@ -564,10 +733,10 @@ export default async function handler(req, res) {
 
     const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
     const reply = completion.choices[0].message.content?.trim() || "OK";
-    await dbg("reply_out", { channel, to: from, reply }, userId); // log the final reply
+    await dbg("reply_out", { channel, to: from, reply }, userId);
 
     await saveTurn(userId, "assistant", reply, channel, from);
-    await setCredits(userId, Math.max(0, credits - 1)); // simple debit
+    await setCredits(userId, Math.max(0, credits - 1));
 
     const extracted = await extractMemory(prior, body);
     const merged = mergeMemory(prior, extracted);
