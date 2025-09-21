@@ -138,16 +138,19 @@ function postProcessReply(reply, userMsg, prior) {
   const lower = r.toLowerCase();
   const tooShort = r.length < 8 || ["ok", "okay", "k", "sure", "noted"].includes(lower);
 
-  // Heuristic: if user asked for contacts or emergency list, don't auto-append more.
-  const noNudge = /\b(emergency\s+contacts?|contact\s+list|contacts)\b/i.test(userMsg);
+  // Keep admin-style answers short but not "OK"
+  const adminy = /\b(emergency|contact|contacts|buy|help|settings?)\b/i.test(userMsg);
 
-  if (!tooShort || noNudge) return r;
+  if (!tooShort) return r;
 
-  // Build a tiny acknowledgement + micro follow-up
   const name = prior?.name ? prior.name : null;
-  const hi = name ? `Got it, ${name}.` : "Got it.";
+  if (adminy) {
+    return name ? `All set, ${name}.` : "All set.";
+  }
+
+  const ack = name ? `Got it, ${name}.` : "Got it.";
   const ask = "Anything else you’d like me to sort out?";
-  return `${hi} ${ask}`;
+  return `${ack} ${ask}`;
 }
 
 /* -------- name/phone utils -------- */
@@ -544,15 +547,32 @@ async function sendEmergencyAlert({ userId, from }) {
 }
 
 /* ---- emergency command parsing (kept for power users) ---- */
-function parseAddEmergency(text="") {
-  const re = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
-  const m = text.trim().match(re);
-  if (!m) return null;
-  const name = sanitizeName(m[1]);
-  const phone = normalizePhone(m[2]);
-  const channel = (m[3] || "both").toLowerCase();
-  if (isBadName(name)) return null;
-  return { name, phone, channel };
+/* UPDATED: accept both orders (name→phone) and (phone→name) */
+function parseAddEmergency(text = "") {
+  const t = text.trim();
+
+  // Pattern A: name THEN phone
+  const reA = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
+  // Pattern B: phone THEN name
+  const reB = /add\s+emergency\s+contact\s+(\+?\d[\d\s().-]{6,})\s+([a-z][a-z\s'’-]{1,60})(?:\s+(sms|whatsapp|both))?$/i;
+
+  let m = t.match(reA);
+  if (m) {
+    const name = sanitizeName(m[1]);
+    const phone = normalizePhone(m[2]);
+    const channel = (m[3] || "both").toLowerCase();
+    if (isBadName(name)) return null;
+    return { name, phone, channel };
+  }
+  m = t.match(reB);
+  if (m) {
+    const name = sanitizeName(m[2]);
+    const phone = normalizePhone(m[1]);
+    const channel = (m[3] || "both").toLowerCase();
+    if (isBadName(name)) return null;
+    return { name, phone, channel };
+  }
+  return null;
 }
 function parseRemoveEmergency(text="") {
   const re = /(?:remove|delete)\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})$/i;
@@ -646,6 +666,8 @@ export default async function handler(req, res) {
 
     /* ==================== EMERGENCY: natural-language router (free) ==================== */
     const emgNLU = await emgExtractNatural(body);
+    await dbg("emg_nlu", emgNLU, userId); // <--- log what NLU extracted
+
     if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
       if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
         const channelPref = (emgNLU.channel || "both").toLowerCase();
@@ -691,6 +713,7 @@ export default async function handler(req, res) {
     // --- Emergency power-user regex (still supported)
     const addEmg = parseAddEmergency(body);
     if (addEmg) {
+      await dbg("emg_upsert_req", addEmg, userId); // <--- visibility when regex path hits
       const r = await upsertEmergencyContact({ userId, ...addEmg });
       const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`)
                        : "Sorry, I couldn't save that emergency contact.";
@@ -803,14 +826,14 @@ export default async function handler(req, res) {
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
 
     const messages = [
-      { role: "system", content: buildSystemPrompt(prior) }, // <-- richer persona + memory snapshot
+      { role: "system", content: buildSystemPrompt(prior) }, // richer persona + memory snapshot
       ...history.slice(-11),
       { role: "user", content: userContent },
     ];
 
     const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
     let reply = completion.choices[0].message.content?.trim() || "OK";
-    reply = postProcessReply(reply, userMsg, prior); // <-- avoid dull “OK”, add tiny follow-up if needed
+    reply = postProcessReply(reply, userMsg, prior); // avoid dull “OK”, add tiny follow-up if needed
 
     await dbg("reply_out", { channel, to: from, reply }, userId);
 
