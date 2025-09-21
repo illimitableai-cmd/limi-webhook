@@ -23,7 +23,6 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
   const args = { model, messages };
   if (isGpt5) {
     args.max_completion_tokens = maxTokens;
-    // omit temperature for gpt-5
   } else {
     args.max_tokens = maxTokens;
     args.temperature = temperature;
@@ -100,11 +99,11 @@ async function extractMemory(prior, newMsg) {
   } catch { return {}; }
 }
 
-/* -------- name/phone utils (sanitize, choose better, normalize) -------- */
+/* -------- name/phone utils -------- */
 function sanitizeName(raw = "") {
   let n = String(raw)
-    .replace(/['’]\s*s\b/gi, "")                     // drop possessive
-    .replace(/\b(number|mobile|cell|phone)\b/gi, "") // drop label words
+    .replace(/['’]\s*s\b/gi, "")
+    .replace(/\b(number|mobile|cell|phone)\b/gi, "")
     .replace(/\s{2,}/g, " ")
     .trim();
   n = n.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
@@ -124,23 +123,16 @@ function betterName(existing = "", incoming = "") {
 function normalizePhone(phone = "") {
   let d = String(phone).replace(/[^\d+]/g, "");
   if (d.startsWith("00")) d = "+" + d.slice(2);
-  if (d.startsWith("0")) d = "+44" + d.slice(1); // UK default
+  if (d.startsWith("0")) d = "+44" + d.slice(1);
   return d;
 }
-
-/** Pretty-print any E.164-ish number (kept for future use) */
 function prettyPhone(p = "") {
   const e = normalizePhone(p);
   if (!e.startsWith("+")) return e;
-
   let m;
-  m = e.match(/^\+44(\d{4})(\d{3})(\d{3})$/);
-  if (m) return `+44 ${m[1]} ${m[2]} ${m[3]}`;
-  m = e.match(/^\+1(\d{3})(\d{3})(\d{4})$/);
-  if (m) return `+1 ${m[1]} ${m[2]} ${m[3]}`;
-  m = e.match(/^\+61(\d)(\d{4})(\d{4})$/);
-  if (m) return `+61 ${m[1]} ${m[2]} ${m[3]}`;
-
+  m = e.match(/^\+44(\d{4})(\d{3})(\d{3})$/); if (m) return `+44 ${m[1]} ${m[2]} ${m[3]}`;
+  m = e.match(/^\+1(\d{3})(\d{3})(\d{4})$/);  if (m) return `+1 ${m[1]} ${m[2]} ${m[3]}`;
+  m = e.match(/^\+61(\d)(\d{4})(\d{4})$/);    if (m) return `+61 ${m[1]} ${m[2]} ${m[3]}`;
   const ccMatch = e.match(/^\+(\d{1,3})(\d+)$/);
   if (!ccMatch) return e;
   const cc = ccMatch[1], rest = ccMatch[2];
@@ -152,13 +144,11 @@ function prettyPhone(p = "") {
   return `+${cc} ${chunks.reverse().join(" ")}`;
 }
 
-// ---- contacts helper (smart dedupe: by phone, then by name; keep best name) ----
+// ---- contacts helper ----
 async function upsertContact({ userId, name, phone, channel }) {
   const tidyIncoming = sanitizeName(name);
   const normPhone = normalizePhone(phone);
-
   try {
-    // by phone
     const { data: byPhone } = await supabase
       .from("contacts").select("id,name,phone,channel")
       .eq("user_id", userId).eq("phone", normPhone).maybeSingle();
@@ -175,11 +165,9 @@ async function upsertContact({ userId, name, phone, channel }) {
       return { ok: true, action: "update_by_phone" };
     }
 
-    // by name
     const { data: byName } = await supabase
       .from("contacts").select("id,name,phone,channel")
       .eq("user_id", userId).ilike("name", tidyIncoming);
-
     const existingByName = (byName || []).find(
       (r) => (r.name || "").trim().toLowerCase() === tidyIncoming.toLowerCase()
     );
@@ -191,7 +179,6 @@ async function upsertContact({ userId, name, phone, channel }) {
       return { ok: true, action: "update_by_name" };
     }
 
-    // insert
     const { error: insErr } = await supabase.from("contacts")
       .insert({ user_id: userId, name: tidyIncoming, phone: normPhone, channel });
     if (insErr) { await dbg("contact_insert_error", { code: insErr.code, message: insErr.message }, userId); return { ok: false, error: insErr }; }
@@ -204,12 +191,11 @@ async function upsertContact({ userId, name, phone, channel }) {
   }
 }
 
-/* -------- DB helpers (restored) -------- */
+/* -------- DB helpers -------- */
 async function getOrCreateUserId(identifier) {
   const { data: ident, error: identErr } = await supabase
     .from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
   if (identErr) await dbg("identifiers_select_error", { message: identErr.message, code: identErr.code, details: identErr.details });
-
   if (ident?.user_id) return ident.user_id;
 
   const { data: user, error: userErr } = await supabase
@@ -280,10 +266,8 @@ async function ensureCredits(userId) {
 /** -------- Contact parsing + LLM fallback -------- */
 function parseSaveContact(msg) {
   const text = (msg || "").trim();
-
   const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
   let phone = phoneMatch ? phoneMatch[1] : null;
-
   const patterns = [
     /(?:save|add)?\s*([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*['’]\s*s\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
@@ -295,7 +279,6 @@ function parseSaveContact(msg) {
     /add\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})[\s,]+(\+?\d[\d\s().-]{6,})/i,
   ];
-
   let name = null;
   for (const re of patterns) {
     const m = re.exec(text);
@@ -304,13 +287,10 @@ function parseSaveContact(msg) {
     if (m[1]) name  = m[1];
     break;
   }
-
   if (!name || !phone) return null;
-
   const tidyName = sanitizeName(name);
   const normPhone = normalizePhone(phone);
   if (isBadName(tidyName)) return null;
-
   return { name: tidyName, phone: normPhone };
 }
 
@@ -360,18 +340,16 @@ function isContactListQuery(text = "") {
   );
 }
 
-/* -------- Likely-name detector & QUICK NAME EXTRACTOR -------- */
+/* -------- Likely-name detector -------- */
 const NAME_STOPWORDS = new Set([
   "ok","okay","k","thanks","thank you","ta","cheers","yes","yeah","yep","no","nope",
   "hello","hi","hey","yo","sup","test","testing","help","buy","contacts","contact","list"
 ]);
-
 function isLikelyName(text = "") {
   const t = (text || "").trim();
   if (!/^[a-zA-Z][a-zA-Z'’-]{1,60}(?:\s+[a-zA-Z][a-zA-Z'’-]{1,60}){0,2}$/.test(t)) return false;
   return !NAME_STOPWORDS.has(t.toLowerCase());
 }
-
 function extractNameQuick(text = "") {
   const t = (text || "").trim();
   const patterns = [
@@ -395,6 +373,29 @@ function extractNameQuick(text = "") {
 }
 
 /* ===================== EMERGENCY CONTACTS ===================== */
+
+/** Natural-language emergency intent extractor (free, tiny response) */
+async function emgExtractNatural(text = "") {
+  const sys =
+    'Return ONLY compact JSON like {"intent":"add|remove|list|none","name":"...","phone":"...","channel":"sms|whatsapp|both"}.' +
+    " Infer intent from natural language about emergency contacts. " +
+    " If adding, include name and phone; channel optional (default both). " +
+    " If removing, include name when present. If asking to see them, intent=list.";
+  const user = `Text: ${text}`;
+  try {
+    const c = await safeChatCompletion({
+      model: MEMORY_MODEL,
+      messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+      maxTokens: 90,
+    });
+    const t = c.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+  } catch {
+    return { intent: "none" };
+  }
+}
+
 async function listEmergencyContacts(userId) {
   const { data, error } = await supabase
     .from("emergency_contacts")
@@ -405,30 +406,32 @@ async function listEmergencyContacts(userId) {
   return data || [];
 }
 
+/** Upsert by PHONE first (prevents duplicates), else insert */
 async function upsertEmergencyContact({ userId, name, phone, channel = "both" }) {
   const tidyName = sanitizeName(name);
   const normPhone = normalizePhone(phone);
-  const { data: existing } = await supabase
+
+  const { data: byPhone } = await supabase
     .from("emergency_contacts")
     .select("id,name,phone,channel")
     .eq("user_id", userId)
-    .ilike("name", tidyName);
+    .eq("phone", normPhone)
+    .maybeSingle();
 
-  const row = (existing || []).find(r => (r.name || "").trim().toLowerCase() === tidyName.toLowerCase());
-  if (row) {
+  if (byPhone) {
     const { error } = await supabase
       .from("emergency_contacts")
-      .update({ phone: normPhone, channel })
-      .eq("id", row.id);
+      .update({ name: tidyName, channel })
+      .eq("id", byPhone.id);
     if (error) { await dbg("emg_update_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
-    return { ok:true, action:"update" };
-  } else {
-    const { error } = await supabase
-      .from("emergency_contacts")
-      .insert({ user_id: userId, name: tidyName, phone: normPhone, channel });
-    if (error) { await dbg("emg_insert_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
-    return { ok:true, action:"insert" };
+    return { ok:true, action:"update_phone" };
   }
+
+  const { error } = await supabase
+    .from("emergency_contacts")
+    .insert({ user_id: userId, name: tidyName, phone: normPhone, channel });
+  if (error) { await dbg("emg_insert_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
+  return { ok:true, action:"insert" };
 }
 
 async function removeEmergencyContact(userId, name) {
@@ -469,11 +472,9 @@ async function sendEmergencyAlert({ userId, from }) {
     const to = normalizePhone(c.phone);
     const via = (c.channel || "both").toLowerCase();
 
-    // SMS
     if (via === "sms" || via === "both") {
       tasks.push(twilioClient.messages.create({ from: TWILIO_FROM, to, body: msg }));
     }
-    // WhatsApp (ensure from/to use whatsapp:)
     if (via === "whatsapp" || via === "both") {
       const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
       const waTo   = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
@@ -491,9 +492,8 @@ async function sendEmergencyAlert({ userId, from }) {
   }
 }
 
-/* ---- emergency command parsing ---- */
+/* ---- emergency command parsing (kept for power users) ---- */
 function parseAddEmergency(text="") {
-  // e.g., "add emergency contact John +447... [sms|whatsapp|both]"
   const re = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
   const m = text.trim().match(re);
   if (!m) return null;
@@ -581,7 +581,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- "WHAT IS MY NAME?" quick answer (no model, no credits) ---
+    // --- "WHAT IS MY NAME?" quick answer ---
     if (/^\s*what('?| i)?s?\s+my\s+name\??\s*$/i.test(body) || /^\s*what\s+is\s+my\s+name\??\s*$/i.test(body)) {
       const { data: memRow1 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
       const name = memRow1?.summary?.name;
@@ -593,9 +593,51 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    /* ==================== EMERGENCY COMMANDS (free) ==================== */
+    /* ==================== EMERGENCY: natural-language router (free) ==================== */
+    const emgNLU = await emgExtractNatural(body);
+    if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
+      if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
+        const channelPref = (emgNLU.channel || "both").toLowerCase();
+        const r = await upsertEmergencyContact({
+          userId,
+          name: emgNLU.name,
+          phone: emgNLU.phone,
+          channel: ["sms","whatsapp","both"].includes(channelPref) ? channelPref : "both",
+        });
+        const msg = r.ok
+          ? (r.action === "insert" || r.action === "update_phone"
+              ? `Added emergency contact: ${sanitizeName(emgNLU.name)}.`
+              : `Updated emergency contact: ${sanitizeName(emgNLU.name)}.`)
+          : "Sorry, I couldn't save that emergency contact.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      }
 
-    // add emergency contact
+      if (emgNLU.intent === "remove" && emgNLU.name) {
+        const ok = await removeEmergencyContact(userId, emgNLU.name);
+        const msg = ok ? `Removed emergency contact: ${sanitizeName(emgNLU.name)}.`
+                       : "Sorry, I couldn't remove that emergency contact.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      }
+
+      if (emgNLU.intent === "list") {
+        const list = await listEmergencyContacts(userId);
+        const msg = list.length
+          ? "🚨 Emergency Contacts:\n" + list.map(c => `- ${sanitizeName(c.name)}: ${normalizePhone(c.phone)} (${c.channel||'both'})`).join("\n")
+          : "You have no emergency contacts yet. You can say things like “add my mum to my emergency contacts, 07123 456789”.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      }
+    }
+
+    // --- Emergency power-user regex (still supported)
     const addEmg = parseAddEmergency(body);
     if (addEmg) {
       const r = await upsertEmergencyContact({ userId, ...addEmg });
@@ -607,7 +649,6 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // remove emergency contact
     const remEmg = parseRemoveEmergency(body);
     if (remEmg) {
       const ok = await removeEmergencyContact(userId, remEmg);
@@ -618,7 +659,6 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // list emergency contacts
     if (isEmergencyList(body)) {
       const list = await listEmergencyContacts(userId);
       const msg = list.length
@@ -630,7 +670,7 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // HELP trigger
+    // HELP trigger (send alert)
     if (isHelpTrigger(body)) {
       const result = await sendEmergencyAlert({ userId, from });
       let msg = "";
