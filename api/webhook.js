@@ -120,12 +120,10 @@ function parseSaveContact(msg){
 export default async function handler(req, res){
   try {
     // quick debug ping
-    if (req.method === "GET"){
-      if (req.query?.ping){
-        await dbg("ping", { at: new Date().toISOString() });
-        return res.status(200).send("ping logged");
-      }
-      return res.status(200).send("Limi webhook alive");
+if (req.method === "GET") {
+  await dbg("ping", { at: new Date().toISOString() });
+  return res.status(200).send("ping logged");
+}
     }
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
