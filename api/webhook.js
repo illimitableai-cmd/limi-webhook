@@ -93,7 +93,6 @@ async function extractMemory(prior, newMsg) {
 
 // ---- contacts helper (adds debug & handles errors) ----
 async function upsertContact({ userId, name, phone, channel }) {
-  // title-case the name a bit to keep things tidy
   const tidyName = (name || "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
   const { error } = await supabase
     .from("contacts")
@@ -112,14 +111,58 @@ async function upsertContact({ userId, name, phone, channel }) {
 }
 
 // ---- db helpers ----
+// NEW: race-proof + debuggable
 async function getOrCreateUserId(identifier) {
-  const { data: ident } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+  // 1) Try to find existing mapping
+  const { data: ident, error: identErr } = await supabase
+    .from("identifiers")
+    .select("user_id")
+    .eq("value", identifier)
+    .maybeSingle();
+
+  if (identErr) {
+    await dbg("identifiers_select_error", { message: identErr.message, code: identErr.code, details: identErr.details });
+  }
   if (ident?.user_id) return ident.user_id;
-  const { data: user, error } = await supabase.from("users").insert([{ display_name: null }]).select().single();
-  if (error) throw error;
-  await supabase.from("identifiers").insert([{ user_id: user.id, type: "phone", value: identifier }]);
+
+  // 2) Create user
+  const { data: user, error: userErr } = await supabase
+    .from("users")
+    .insert([{ display_name: null }])
+    .select()
+    .single();
+
+  if (userErr) {
+    await dbg("users_insert_error", { message: userErr.message, code: userErr.code, details: userErr.details });
+    // Race? Re-check identifiers then give up
+    const { data: ident2 } = await supabase
+      .from("identifiers")
+      .select("user_id")
+      .eq("value", identifier)
+      .maybeSingle();
+    if (ident2?.user_id) return ident2.user_id;
+    throw userErr;
+  }
+
+  // 3) Link identifier → user (handle unique/race)
+  const { error: linkErr } = await supabase
+    .from("identifiers")
+    .insert([{ user_id: user.id, type: "phone", value: identifier }]);
+
+  if (linkErr) {
+    await dbg("identifiers_insert_error", { message: linkErr.message, code: linkErr.code, details: linkErr.details });
+    const { data: ident3 } = await supabase
+      .from("identifiers")
+      .select("user_id")
+      .eq("value", identifier)
+      .maybeSingle();
+    if (ident3?.user_id) return ident3.user_id;
+    throw linkErr;
+  }
+
   return user.id;
 }
+
 async function loadRecentTurns(userId, limit = 12) {
   const { data } = await supabase
     .from("messages")
@@ -210,7 +253,7 @@ export default async function handler(req, res) {
         );
     }
 
-    // identify user
+    // identify user (now race-proof)
     const userId = await getOrCreateUserId(from);
     await dbg("user_identified", { userId, from }, userId);
 
@@ -328,6 +371,7 @@ export default async function handler(req, res) {
     return res.status(200).send(`<Response><Message>${escapeXml(reply + footer)}</Message></Response>`);
   } catch (e) {
     console.error("handler fatal", e);
+    await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
     res.setHeader("Content-Type", "text/xml");
     return res.status(200).send("<Response><Message>Sorry, something went wrong.</Message></Response>");
   }
