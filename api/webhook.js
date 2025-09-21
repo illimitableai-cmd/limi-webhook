@@ -85,7 +85,10 @@ function mergeMemory(oldMem, add) {
   return m;
 }
 async function extractMemory(prior, newMsg) {
-  const sys = "Return ONLY JSON of long-lived facts (name,location,email,birthday,timezone,preferences,interests,goals,notes). If none, return {}. If the message is about saving someone ELSE as a contact, DO NOT set name/email/birthday/timezone.";
+  const sys =
+    "Return ONLY JSON of long-lived user facts to remember: " +
+    "(name, location, email, birthday, timezone, preferences (map), interests (array), goals (array), notes (array)). " +
+    "Include only info about the user (not other people). Exclude short-lived chat content. If none, return {}.";
   const user = `Prior: ${JSON.stringify(prior || {})}\nMessage: "${newMsg}"`;
   const c = await safeChatCompletion({
     model: MEMORY_MODEL,
@@ -97,6 +100,54 @@ async function extractMemory(prior, newMsg) {
     const s = t.indexOf("{"), e = t.lastIndexOf("}");
     return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
   } catch { return {}; }
+}
+
+/** Compact memory snapshot for prompting */
+function memorySnapshotForPrompt(mem) {
+  if (!mem) return "None";
+  const parts = [];
+  if (mem.name) parts.push(`name: ${mem.name}`);
+  if (mem.location) parts.push(`location: ${mem.location}`);
+  if (mem.timezone) parts.push(`timezone: ${mem.timezone}`);
+  const prefs = mem.preferences && Object.keys(mem.preferences).length ? `preferences: ${JSON.stringify(mem.preferences)}` : null;
+  const interests = mem.interests && mem.interests.length ? `interests: ${mem.interests.slice(0,6).join(", ")}` : null;
+  const goals = mem.goals && mem.goals.length ? `goals: ${mem.goals.slice(0,4).join(", ")}` : null;
+  const notes = mem.notes && mem.notes.length ? `notes: ${mem.notes.slice(0,4).join("; ")}` : null;
+  [prefs, interests, goals, notes].forEach(x => { if (x) parts.push(x); });
+  return parts.length ? parts.join(" • ") : "None";
+}
+
+/** Friendly UK persona + behaviour */
+function buildSystemPrompt(prior) {
+  const snapshot = memorySnapshotForPrompt(prior);
+  return [
+    "You are Limi, a warm, concise WhatsApp/SMS assistant. Use UK spelling.",
+    "Style: friendly, to-the-point, no waffle; 1–2 sentences when possible.",
+    "If an image is provided, describe briefly only if helpful, then answer.",
+    "Use the user's profile when it helps. Address them by name if known.",
+    "Ask at most ONE short, natural follow-up question when it clearly adds value.",
+    "If the user gave info (not a question), acknowledge it briefly and offer next helpful step.",
+    "Avoid generic replies like 'OK' or 'Sure'.",
+    `User profile snapshot: ${snapshot}`
+  ].join("\n");
+}
+
+/** Post-process to avoid dull replies and add micro follow-ups without extra API calls */
+function postProcessReply(reply, userMsg, prior) {
+  const r = (reply || "").trim();
+  const lower = r.toLowerCase();
+  const tooShort = r.length < 8 || ["ok", "okay", "k", "sure", "noted"].includes(lower);
+
+  // Heuristic: if user asked for contacts or emergency list, don't auto-append more.
+  const noNudge = /\b(emergency\s+contacts?|contact\s+list|contacts)\b/i.test(userMsg);
+
+  if (!tooShort || noNudge) return r;
+
+  // Build a tiny acknowledgement + micro follow-up
+  const name = prior?.name ? prior.name : null;
+  const hi = name ? `Got it, ${name}.` : "Got it.";
+  const ask = "Anything else you’d like me to sort out?";
+  return `${hi} ${ask}`;
 }
 
 /* -------- name/phone utils -------- */
@@ -670,20 +721,6 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // HELP trigger (send alert)
-    if (isHelpTrigger(body)) {
-      const result = await sendEmergencyAlert({ userId, from });
-      let msg = "";
-      if (result.ok) msg = `Alert sent to ${result.count} emergency contact(s).`;
-      else if (result.reason === "cooldown") msg = "Emergency alert was just sent. Please wait a moment before sending another.";
-      else if (result.reason === "no_contacts") msg = "You have no emergency contacts yet. Add one first: add emergency contact Alex +447700900000";
-      else msg = "Sorry, I couldn't send the alert right now.";
-      await saveTurn(userId, "user", body, channel, from);
-      await saveTurn(userId, "assistant", msg, channel, from);
-      res.setHeader("Content-Type","text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
-    }
-
     // ---- CONTACT LIST quick path (no model, no credits)
     if (isContactListQuery(body)) {
       const { data: contacts, error: listErr } = await supabase
@@ -766,13 +803,15 @@ export default async function handler(req, res) {
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
 
     const messages = [
-      { role: "system", content: "You are Limi. Be concise. If an image is provided, describe it and answer the question." },
+      { role: "system", content: buildSystemPrompt(prior) }, // <-- richer persona + memory snapshot
       ...history.slice(-11),
       { role: "user", content: userContent },
     ];
 
     const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
-    const reply = completion.choices[0].message.content?.trim() || "OK";
+    let reply = completion.choices[0].message.content?.trim() || "OK";
+    reply = postProcessReply(reply, userMsg, prior); // <-- avoid dull “OK”, add tiny follow-up if needed
+
     await dbg("reply_out", { channel, to: from, reply }, userId);
 
     await saveTurn(userId, "assistant", reply, channel, from);
