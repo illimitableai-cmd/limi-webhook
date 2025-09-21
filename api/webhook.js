@@ -125,30 +125,22 @@ function normalizePhone(phone = "") {
   return d;
 }
 
-/** Pretty-print any E.164-ish number.
- *  Special rules for +44, +1, +61; fallback groups digits from the RIGHT in 3s. */
+/** Pretty-print any E.164-ish number (kept for future use) */
 function prettyPhone(p = "") {
   const e = normalizePhone(p);
   if (!e.startsWith("+")) return e;
 
   let m;
-  // UK mobiles (common case): +44 7xxx xxx xxx
   m = e.match(/^\+44(\d{4})(\d{3})(\d{3})$/);
   if (m) return `+44 ${m[1]} ${m[2]} ${m[3]}`;
-
-  // US/Canada: +1 555 123 4567
   m = e.match(/^\+1(\d{3})(\d{3})(\d{4})$/);
   if (m) return `+1 ${m[1]} ${m[2]} ${m[3]}`;
-
-  // Australia common: +61 4 1234 5678 (mobile) or +61 2 1234 5678
   m = e.match(/^\+61(\d)(\d{4})(\d{4})$/);
   if (m) return `+61 ${m[1]} ${m[2]} ${m[3]}`;
 
-  // Fallback: group from RIGHT into 3s after the country code
   const ccMatch = e.match(/^\+(\d{1,3})(\d+)$/);
   if (!ccMatch) return e;
   const cc = ccMatch[1], rest = ccMatch[2];
-  // group right -> triplets
   const chunks = [];
   for (let i = rest.length; i > 0; i -= 3) {
     const start = Math.max(0, i - 3);
@@ -257,7 +249,6 @@ async function setCredits(userId, balance) {
 function parseSaveContact(msg) {
   const text = (msg || "").trim();
 
-  // Pull any phone
   const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
   let phone = phoneMatch ? phoneMatch[1] : null;
 
@@ -391,8 +382,9 @@ export default async function handler(req, res) {
       if (!listErr && Array.isArray(contacts) && contacts.length) {
         const rows = contacts.map(c => {
           const name  = sanitizeName(c.name || "");
-          const phone = prettyPhone(c.phone || "");
-          return `- ${name} — ${phone}`;
+          // show compact E.164 (no spaces), heal local UK numbers to +44
+          const phone = normalizePhone(c.phone || "");
+          return `- ${name}: ${phone}`;
         });
         msg = "📇 Your Contacts:\n" + rows.join("\n");
       } else if (listErr) {
