@@ -90,23 +90,88 @@ async function extractMemory(prior, newMsg) {
   }
 }
 
-// ---- contacts helper (adds debug & handles errors) ----
+// ---- contacts helper (smart dedupe: by phone, then by name) ----
 async function upsertContact({ userId, name, phone, channel }) {
-  const tidyName = (name || "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-  const { error } = await supabase
-    .from("contacts")
-    .upsert({ user_id: userId, name: tidyName, phone, channel }, { onConflict: "user_id,name" });
+  const tidyName = (name || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 
-  if (error) {
-    await dbg(
-      "contact_upsert_error",
-      { name: tidyName, phone, channel, code: error.code, message: error.message, details: error.details },
-      userId
+  try {
+    // 1) Already have this phone?
+    const { data: byPhone, error: selPhoneErr } = await supabase
+      .from("contacts")
+      .select("id, name, phone, channel")
+      .eq("user_id", userId)
+      .eq("phone", phone)
+      .maybeSingle();
+
+    if (selPhoneErr) {
+      await dbg("contact_select_phone_error", { code: selPhoneErr.code, message: selPhoneErr.message }, userId);
+    }
+
+    if (byPhone) {
+      const needsUpdate =
+        (byPhone.name || "") !== tidyName || (byPhone.channel || "") !== (channel || "");
+      if (needsUpdate) {
+        const { error: upErr } = await supabase
+          .from("contacts")
+          .update({ name: tidyName, channel })
+          .eq("id", byPhone.id);
+        if (upErr) {
+          await dbg("contact_update_error", { code: upErr.code, message: upErr.message }, userId);
+          return { ok: false, error: upErr };
+        }
+      }
+      await dbg("contact_upsert_ok", { action: "update_by_phone", name: tidyName, phone, channel }, userId);
+      return { ok: true, action: "update_by_phone" };
+    }
+
+    // 2) No phone match — check if we already have this name (case-insensitive)
+    const { data: byName, error: selNameErr } = await supabase
+      .from("contacts")
+      .select("id, name, phone, channel")
+      .eq("user_id", userId)
+      .ilike("name", tidyName); // case-insensitive
+
+    if (selNameErr) {
+      await dbg("contact_select_name_error", { code: selNameErr.code, message: selNameErr.message }, userId);
+    }
+
+    const existingByName = (byName || []).find(
+      (r) => (r.name || "").trim().toLowerCase() === tidyName.toLowerCase()
     );
-    return { ok: false, error };
+
+    if (existingByName) {
+      const { error: upErr2 } = await supabase
+        .from("contacts")
+        .update({ phone, channel })
+        .eq("id", existingByName.id);
+      if (upErr2) {
+        await dbg("contact_update_conflict", { code: upErr2.code, message: upErr2.message }, userId);
+        return { ok: false, error: upErr2 };
+      }
+      await dbg("contact_upsert_ok", { action: "update_by_name", name: tidyName, phone, channel }, userId);
+      return { ok: true, action: "update_by_name" };
+    }
+
+    // 3) Insert new
+    const { error: insErr } = await supabase
+      .from("contacts")
+      .insert({ user_id: userId, name: tidyName, phone, channel });
+
+    if (insErr) {
+      await dbg("contact_insert_error", { code: insErr.code, message: insErr.message, phone, name: tidyName }, userId);
+      return { ok: false, error: insErr };
+    }
+
+    await dbg("contact_upsert_ok", { action: "insert_new", name: tidyName, phone, channel }, userId);
+    return { ok: true, action: "insert_new" };
+  } catch (e) {
+    await dbg("contact_upsert_exception", { message: String(e?.message || e) }, userId);
+    return { ok: false, error: e };
   }
-  await dbg("contact_upsert_ok", { name: tidyName, phone, channel }, userId);
-  return { ok: true };
 }
 
 // ---- db helpers ----
