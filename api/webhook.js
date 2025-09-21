@@ -354,13 +354,24 @@ function isContactListQuery(text = "") {
     /(^|\b)(show|list|see|view|display)\s+(my\s+)?contacts(\b|$)/i.test(text) ||
     /(^|\b)can\s+i\s+have\s+(my\s+)?contact\s+list(\b|$)/i.test(text) ||
     /(^|\b)contacts\s+please(\b|$)/i.test(text) ||
-    /\bwhat('?| i)?s?\s+my\s+contact\s+list\??$/i.test(text) || // NEW
-    /\bwhat\s+is\s+my\s+contact\s+list\??$/i.test(text) ||      // NEW
-    /\bwho\s+is\s+in\s+my\s+contacts\??$/i.test(text)           // NEW
+    /\bwhat('?| i)?s?\s+my\s+contact\s+list\??$/i.test(text) ||
+    /\bwhat\s+is\s+my\s+contact\s+list\??$/i.test(text) ||
+    /\bwho\s+is\s+in\s+my\s+contacts\??$/i.test(text)
   );
 }
 
-/* -------- QUICK NAME EXTRACTOR (no model) -------- */
+/* -------- Likely-name detector & QUICK NAME EXTRACTOR -------- */
+const NAME_STOPWORDS = new Set([
+  "ok","okay","k","thanks","thank you","ta","cheers","yes","yeah","yep","no","nope",
+  "hello","hi","hey","yo","sup","test","testing","help","buy","contacts","contact","list"
+]);
+
+function isLikelyName(text = "") {
+  const t = (text || "").trim();
+  if (!/^[a-zA-Z][a-zA-Z'’-]{1,60}(?:\s+[a-zA-Z][a-zA-Z'’-]{1,60}){0,2}$/.test(t)) return false;
+  return !NAME_STOPWORDS.has(t.toLowerCase());
+}
+
 function extractNameQuick(text = "") {
   const t = (text || "").trim();
   const patterns = [
@@ -375,6 +386,11 @@ function extractNameQuick(text = "") {
       const name = sanitizeName(m[1]);
       if (!isBadName(name)) return name;
     }
+  }
+  // bare name like "Ashley" or "Ashley Leggett"
+  if (isLikelyName(t)) {
+    const name = sanitizeName(t);
+    if (!isBadName(name)) return name;
   }
   return null;
 }
@@ -428,18 +444,22 @@ export default async function handler(req, res) {
     // --- QUICK NAME SAVE (no model, no credits) ---
     const quickName = extractNameQuick(body);
     if (quickName) {
+      // only save if we don't already have a name
       const { data: memRow0 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
-      const prior0 = memRow0?.summary ?? blankMemory();
-      const merged0 = mergeMemory(prior0, { name: quickName });
-      await supabase.from("memories").upsert({ user_id: userId, summary: merged0 });
-      await upsertContact({ userId, name: quickName, phone: from, channel });
+      const hasName = !!memRow0?.summary?.name;
+      if (!hasName) {
+        const prior0 = memRow0?.summary ?? blankMemory();
+        const merged0 = mergeMemory(prior0, { name: quickName });
+        await supabase.from("memories").upsert({ user_id: userId, summary: merged0 });
+        await upsertContact({ userId, name: quickName, phone: from, channel });
 
-      const ack = `Nice to meet you, ${quickName}. I’ll remember that.`;
-      await saveTurn(userId, "user", body, channel, from);
-      await saveTurn(userId, "assistant", ack, channel, from);
+        const ack = `Nice to meet you, ${quickName}. I’ll remember that.`;
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", ack, channel, from);
 
-      res.setHeader("Content-Type", "text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(ack)}</Message></Response>`);
+        res.setHeader("Content-Type", "text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(ack)}</Message></Response>`);
+      }
     }
 
     // --- "WHAT IS MY NAME?" quick answer (no model, no credits) ---
