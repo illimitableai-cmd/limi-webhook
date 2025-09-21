@@ -11,6 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 const TWILIO_FROM = process.env.TWILIO_FROM;
 
+// Models (GPT-5 by default; set via env if you like)
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 
@@ -37,7 +38,7 @@ async function fetchTwilioMediaB64(url){
   return buf.toString("base64");
 }
 
-// --- memory helpers ---
+// ---- memory helpers ----
 function blankMemory(){
   return { name:null, location:null, email:null, birthday:null, timezone:null,
            preferences:{}, interests:[], goals:[], notes:[], last_seen:new Date().toISOString() };
@@ -68,7 +69,7 @@ async function extractMemory(prior, newMsg){
   } catch { return {}; }
 }
 
-// --- db helpers ---
+// ---- db helpers ----
 async function getOrCreateUserId(identifier){
   const { data: ident } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
   if (ident?.user_id) return ident.user_id;
@@ -93,11 +94,9 @@ async function setCredits(userId, balance){
   await supabase.from("credits").upsert({ user_id:userId, balance });
 }
 
-// --- contact intent (no credits, no memory change) ---
+// ---- contact intent (no credits, no memory change) ----
 function parseSaveContact(msg){
-  // returns {name, phone} or null
   const phone = (msg.match(/(\+?\d[\d\s()+-]{6,})/g)||[])[0];
-  // name phrases
   const patterns = [
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact/i,
     /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact/i,
@@ -107,9 +106,7 @@ function parseSaveContact(msg){
   let name = null;
   for (const r of patterns){ const m = r.exec(msg); if (m){ name = m[1]; break; } }
   if (!name || !phone) return null;
-  // tidy
   name = name.trim().replace(/\s+/g," ");
-  // normalise UK-ish phone
   let d = phone.replace(/[^\d+]/g,"");
   if (d.startsWith("00")) d = "+"+d.slice(2);
   if (d.startsWith("0")) d = "+44"+d.slice(1);
@@ -120,14 +117,16 @@ function parseSaveContact(msg){
 export default async function handler(req, res){
   try {
     // quick debug ping
-  if (req.method === "GET") {
-  await dbg("ping", { at: new Date().toISOString() });
-  return res.status(200).send("ping logged");
-}
-    
-    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
-}
-    // parse body
+    if (req.method === "GET") {
+      await dbg("ping", { at: new Date().toISOString() });
+      return res.status(200).send("ping logged");
+    }
+
+    if (req.method !== "POST") {
+      return res.status(405).send("Method Not Allowed");
+    }
+
+    // ---- parse body (everything below stays inside try) ----
     const chunks=[]; for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
     const p = new URLSearchParams(raw);
@@ -170,7 +169,7 @@ export default async function handler(req, res){
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
-    // --- FAST PATH: save contact intent (no credits, no memory change) ---
+    // FAST PATH: save contact intent (no credits, no memory change)
     const contact = parseSaveContact(body);
     if (contact){
       await supabase.from("contacts").upsert(
@@ -234,7 +233,7 @@ export default async function handler(req, res){
     await saveTurn(userId, "assistant", reply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
 
-    // memory update (note: message wasn’t a contact-save, so it’s safe)
+    // memory update
     const extracted = await extractMemory(prior, body);
     const merged = mergeMemory(prior, extracted);
     await supabase.from("memories").upsert({ user_id:userId, summary: merged });
@@ -260,4 +259,3 @@ export default async function handler(req, res){
     return res.status(200).send("<Response><Message>Sorry, something went wrong.</Message></Response>");
   }
 }
-
