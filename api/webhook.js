@@ -20,17 +20,16 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
   const args = { model, messages };
   if (isGpt5) {
     args.max_completion_tokens = maxTokens;
-    // no temperature field for gpt-5
+    // omit temperature for gpt-5
   } else {
     args.max_tokens = maxTokens;
     args.temperature = temperature;
   }
-
   try {
     return await openai.chat.completions.create(args);
   } catch (err) {
     await dbg("model_fallback", { tried: model, error: String(err) });
-    // Fallback to 4o-mini (supports legacy params)
+    // Fallback supports legacy params
     return await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
@@ -44,7 +43,7 @@ function escapeXml(s = "") {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Normalize so SMS & WhatsApp map to the same user
+// Normalize so SMS & WhatsApp map to the same user (E.164-ish, UK default)
 function uidFromTwilio(from = "") {
   let v = from.replace(/^whatsapp:/i, "").replace(/^sms:/i, "").trim();
   v = v.replace(/[^\d+]/g, "");
@@ -68,118 +67,170 @@ async function fetchTwilioMediaB64(url) {
 
 // ---- memory helpers ----
 function blankMemory() {
-  return { name:null, location:null, email:null, birthday:null, timezone:null,
-           preferences:{}, interests:[], goals:[], notes:[], last_seen:new Date().toISOString() };
+  return {
+    name: null, location: null, email: null, birthday: null, timezone: null,
+    preferences: {}, interests: [], goals: [], notes: [], last_seen: new Date().toISOString(),
+  };
 }
-function mergeMemory(oldMem, add){
-  const m = { ...blankMemory(), ...(oldMem||{}) };
-  for (const k of ["name","location","email","birthday","timezone"]) if (add?.[k]) m[k]=add[k];
-  m.preferences = { ...(oldMem?.preferences||{}), ...(add?.preferences||{}) };
-  const dedupe = a => Array.from(new Set((a||[]).filter(Boolean))).slice(0,12);
-  m.interests = dedupe([...(oldMem?.interests||[]), ...(add?.interests||[])]);
-  m.goals     = dedupe([...(oldMem?.goals||[]),     ...(add?.goals||[])]);
-  m.notes     = dedupe([...(oldMem?.notes||[]),     ...(add?.notes||[])]);
+function mergeMemory(oldMem, add) {
+  const m = { ...blankMemory(), ...(oldMem || {}) };
+  for (const k of ["name","location","email","birthday","timezone"]) if (add?.[k]) m[k] = add[k];
+  m.preferences = { ...(oldMem?.preferences || {}), ...(add?.preferences || {}) };
+  const dedupe = (a) => Array.from(new Set((a || []).filter(Boolean))).slice(0, 12);
+  m.interests = dedupe([...(oldMem?.interests || []), ...(add?.interests || [])]);
+  m.goals     = dedupe([...(oldMem?.goals || []),     ...(add?.goals || [])]);
+  m.notes     = dedupe([...(oldMem?.notes || []),     ...(add?.notes || [])]);
   m.last_seen = new Date().toISOString();
   return m;
 }
-async function extractMemory(prior, newMsg){
+async function extractMemory(prior, newMsg) {
   const sys = "Return ONLY JSON of long-lived facts (name,location,email,birthday,timezone,preferences,interests,goals,notes). If none, return {}. If the message is about saving someone ELSE as a contact, DO NOT set name/email/birthday/timezone.";
-  const user = `Prior: ${JSON.stringify(prior||{})}\nMessage: "${newMsg}"`;
+  const user = `Prior: ${JSON.stringify(prior || {})}\nMessage: "${newMsg}"`;
   const c = await safeChatCompletion({
     model: MEMORY_MODEL,
-    messages: [{role:"system",content:sys},{role:"user",content:user}],
-    // no custom temp for gpt-5; helper handles it
-    maxTokens: 180
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    maxTokens: 180,
   });
   try {
     const t = c.choices[0].message.content || "{}";
     const s = t.indexOf("{"), e = t.lastIndexOf("}");
-    return JSON.parse(s>=0 && e>=0 ? t.slice(s,e+1) : "{}");
+    return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
   } catch { return {}; }
 }
 
-/* --- name/phone utils (sanitize, choose better, normalize) --- */
-function sanitizeName(raw=""){
+/* -------- name/phone utils (sanitize, choose better, normalize) -------- */
+function sanitizeName(raw = "") {
   let n = String(raw)
-    .replace(/['’]\s*s\b/gi,"")
-    .replace(/\b(number|mobile|cell|phone)\b/gi,"")
-    .replace(/\s{2,}/g," ")
+    .replace(/['’]\s*s\b/gi, "")                     // drop possessive
+    .replace(/\b(number|mobile|cell|phone)\b/gi, "") // drop label words
+    .replace(/\s{2,}/g, " ")
     .trim();
-  n = n.toLowerCase().replace(/\b\w/g,c=>c.toUpperCase());
+  n = n.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
   return n;
 }
-function isBadName(name=""){
-  return /\b(number|mobile|cell|phone)\b/i.test(name) || /['’]\s*s\b/i.test(name) || name.replace(/[^a-z]/gi,"").length<2;
+function isBadName(name = "") {
+  return /\b(number|mobile|cell|phone)\b/i.test(name) || /['’]\s*s\b/i.test(name) || name.replace(/[^a-z]/gi, "").length < 2;
 }
-function betterName(existing="", incoming=""){
-  const aBad=isBadName(existing), bBad=isBadName(incoming);
+function betterName(existing = "", incoming = "") {
+  const aBad = isBadName(existing), bBad = isBadName(incoming);
   if (bBad && !aBad) return existing;
   if (!bBad && aBad) return incoming;
-  const aTok=(existing||"").trim().split(/\s+/).length;
-  const bTok=(incoming||"").trim().split(/\s+/).length;
-  return bTok>=aTok?incoming:existing;
+  const aTok = (existing || "").trim().split(/\s+/).length;
+  const bTok = (incoming || "").trim().split(/\s+/).length;
+  return bTok >= aTok ? incoming : existing;
 }
-function normalizePhone(phone=""){
-  let d=String(phone).replace(/[^\d+]/g,"");
-  if (d.startsWith("00")) d="+"+d.slice(2);
-  if (d.startsWith("0")) d="+44"+d.slice(1);
+function normalizePhone(phone = "") {
+  let d = String(phone).replace(/[^\d+]/g, "");
+  if (d.startsWith("00")) d = "+" + d.slice(2);
+  if (d.startsWith("0")) d = "+44" + d.slice(1); // UK default
   return d;
 }
 
-// ---- contacts helper (smart dedupe) ----
+// ---- contacts helper (smart dedupe: by phone, then by name; keep best name) ----
 async function upsertContact({ userId, name, phone, channel }) {
   const tidyIncoming = sanitizeName(name);
   const normPhone = normalizePhone(phone);
 
   try {
+    // by phone
     const { data: byPhone } = await supabase
       .from("contacts").select("id,name,phone,channel")
       .eq("user_id", userId).eq("phone", normPhone).maybeSingle();
 
     if (byPhone) {
-      const finalName = betterName(byPhone.name||"", tidyIncoming);
-      const needsUpdate = finalName !== (byPhone.name||"") || (byPhone.channel||"") !== (channel||"");
+      const finalName = betterName(byPhone.name || "", tidyIncoming);
+      const needsUpdate = finalName !== (byPhone.name || "") || (byPhone.channel || "") !== (channel || "");
       if (needsUpdate) {
         const { error: upErr } = await supabase.from("contacts")
           .update({ name: finalName, channel }).eq("id", byPhone.id);
-        if (upErr) { await dbg("contact_update_error",{code:upErr.code,message:upErr.message},userId); return {ok:false,error:upErr}; }
+        if (upErr) { await dbg("contact_update_error", { code: upErr.code, message: upErr.message }, userId); return { ok: false, error: upErr }; }
       }
-      await dbg("contact_upsert_ok",{action:"update_by_phone",name:finalName,phone:normPhone,channel},userId);
-      return { ok:true, action:"update_by_phone" };
+      await dbg("contact_upsert_ok", { action: "update_by_phone", name: finalName, phone: normPhone, channel }, userId);
+      return { ok: true, action: "update_by_phone" };
     }
 
+    // by name
     const { data: byName } = await supabase
       .from("contacts").select("id,name,phone,channel")
-      .eq("user_id", userId).ilike("name", sanitizeName(name));
+      .eq("user_id", userId).ilike("name", tidyIncoming);
 
-    const existingByName = (byName||[]).find(r => (r.name||"").trim().toLowerCase()===tidyIncoming.toLowerCase());
-    if (existingByName){
+    const existingByName = (byName || []).find(
+      (r) => (r.name || "").trim().toLowerCase() === tidyIncoming.toLowerCase()
+    );
+    if (existingByName) {
       const { error: upErr2 } = await supabase.from("contacts")
         .update({ phone: normPhone, channel }).eq("id", existingByName.id);
-      if (upErr2){ await dbg("contact_update_conflict",{code:upErr2.code,message:upErr2.message},userId); return {ok:false,error:upErr2}; }
-      await dbg("contact_upsert_ok",{action:"update_by_name",name:existingByName.name,phone:normPhone,channel},userId);
-      return { ok:true, action:"update_by_name" };
+      if (upErr2) { await dbg("contact_update_conflict", { code: upErr2.code, message: upErr2.message }, userId); return { ok: false, error: upErr2 }; }
+      await dbg("contact_upsert_ok", { action: "update_by_name", name: existingByName.name, phone: normPhone, channel }, userId);
+      return { ok: true, action: "update_by_name" };
     }
 
+    // insert
     const { error: insErr } = await supabase.from("contacts")
-      .insert({ user_id:userId, name: tidyIncoming, phone: normPhone, channel });
-    if (insErr){ await dbg("contact_insert_error",{code:insErr.code,message:insErr.message},userId); return {ok:false,error:insErr}; }
+      .insert({ user_id: userId, name: tidyIncoming, phone: normPhone, channel });
+    if (insErr) { await dbg("contact_insert_error", { code: insErr.code, message: insErr.message }, userId); return { ok: false, error: insErr }; }
 
-    await dbg("contact_upsert_ok",{action:"insert_new",name:tidyIncoming,phone:normPhone,channel},userId);
-    return { ok:true, action:"insert_new" };
-  } catch(e){
-    await dbg("contact_upsert_exception",{message:String(e?.message||e)},userId);
-    return { ok:false, error:e };
+    await dbg("contact_upsert_ok", { action: "insert_new", name: tidyIncoming, phone: normPhone, channel }, userId);
+    return { ok: true, action: "insert_new" };
+  } catch (e) {
+    await dbg("contact_upsert_exception", { message: String(e?.message || e) }, userId);
+    return { ok: false, error: e };
   }
 }
 
-/* -------- contact parsing + LLM fallback -------- */
-function parseSaveContact(msg){
-  const text=(msg||"").trim();
-  const phoneMatch=text.match(/(\+?\d[\d\s().-]{6,})/);
-  let phone=phoneMatch?phoneMatch[1]:null;
+/* -------- DB helpers (restored) -------- */
+async function getOrCreateUserId(identifier) {
+  const { data: ident, error: identErr } = await supabase
+    .from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+  if (identErr) await dbg("identifiers_select_error", { message: identErr.message, code: identErr.code, details: identErr.details });
 
-  const patterns=[
+  if (ident?.user_id) return ident.user_id;
+
+  const { data: user, error: userErr } = await supabase
+    .from("users").insert([{ display_name: null }]).select().single();
+  if (userErr) {
+    await dbg("users_insert_error", { message: userErr.message, code: userErr.code, details: userErr.details });
+    const { data: ident2 } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+    if (ident2?.user_id) return ident2.user_id;
+    throw userErr;
+  }
+
+  const { error: linkErr } = await supabase
+    .from("identifiers").insert([{ user_id: user.id, type: "phone", value: identifier }]);
+  if (linkErr) {
+    await dbg("identifiers_insert_error", { message: linkErr.message, code: linkErr.code, details: linkErr.details });
+    const { data: ident3 } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+    if (ident3?.user_id) return ident3.user_id;
+    throw linkErr;
+  }
+  return user.id;
+}
+async function loadRecentTurns(userId, limit = 12) {
+  const { data } = await supabase
+    .from("messages").select("role, body").eq("user_id", userId)
+    .order("created_at", { ascending: false }).limit(limit);
+  return (data || []).reverse().map((r) => ({ role: r.role, content: r.body }));
+}
+async function saveTurn(userId, role, text, channel, externalId) {
+  await supabase.from("messages").insert([{ user_id: userId, role, body: text, channel, external_id: externalId }]);
+}
+async function getCredits(userId) {
+  const { data } = await supabase.from("credits").select("balance").eq("user_id", userId).maybeSingle();
+  return data?.balance ?? 0;
+}
+async function setCredits(userId, balance) {
+  await supabase.from("credits").upsert({ user_id: userId, balance });
+}
+
+/** -------- Contact parsing + LLM fallback -------- */
+function parseSaveContact(msg) {
+  const text = (msg || "").trim();
+
+  // Pull any phone
+  const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
+  let phone = phoneMatch ? phoneMatch[1] : null;
+
+  const patterns = [
     /(?:save|add)?\s*([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*['’]\s*s\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
@@ -191,53 +242,56 @@ function parseSaveContact(msg){
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})[\s,]+(\+?\d[\d\s().-]{6,})/i,
   ];
 
-  let name=null;
-  for (const re of patterns){
-    const m=re.exec(text); if (!m) continue;
-    if (m[2]) phone=m[2];
-    if (m[1]) name=m[1];
+  let name = null;
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (!m) continue;
+    if (m[2]) phone = m[2];
+    if (m[1]) name  = m[1];
     break;
   }
+
   if (!name || !phone) return null;
 
-  const tidyName=sanitizeName(name);
-  const normPhone=normalizePhone(phone);
+  const tidyName = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
   if (isBadName(tidyName)) return null;
+
   return { name: tidyName, phone: normPhone };
 }
 
-async function llmExtractContact(msg){
-  const sys='Return ONLY compact JSON like {"name":"...","phone":"..."} if the text asks to save/add a contact; otherwise {}. Phone must include country code.';
-  const user=`Text: ${msg}`;
+async function llmExtractContact(msg) {
+  const sys = 'Return ONLY compact JSON like {"name":"...","phone":"..."} if the text asks to save/add a contact; otherwise {}. Phone must include country code.';
+  const user = `Text: ${msg}`;
   const c = await safeChatCompletion({
     model: MEMORY_MODEL,
-    messages: [{role:"system",content:sys},{role:"user",content:user}],
-    maxTokens: 80
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    maxTokens: 80,
   });
-  try{
-    const t=c.choices[0].message.content||"{}";
-    const s=t.indexOf("{"), e=t.lastIndexOf("}");
-    const j=JSON.parse(s>=0&&e>=0?t.slice(s,e+1):"{}");
-    if (j?.name && j?.phone){
-      const tidyName=sanitizeName(j.name);
-      const normPhone=normalizePhone(String(j.phone));
+  try {
+    const t = c.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    const j = JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+    if (j?.name && j?.phone) {
+      const tidyName = sanitizeName(j.name);
+      const normPhone = normalizePhone(String(j.phone));
       if (!isBadName(tidyName)) return { name: tidyName, phone: normPhone };
     }
-  }catch{}
+  } catch {}
   return null;
 }
 
 /* -------- history sanitization -------- */
-function cleanHistory(history){
-  const allowed=new Set(["system","assistant","user","function","tool","developer"]);
-  return (history||[])
-    .filter(m=>m && allowed.has(m.role) && typeof m.content==="string" && m.content.trim().length>0)
-    .map(m=>({ role:m.role, content:m.content.slice(0,4000) }));
+function cleanHistory(history) {
+  const allowed = new Set(["system","assistant","user","function","tool","developer"]);
+  return (history || [])
+    .filter(m => m && allowed.has(m.role) && typeof m.content === "string" && m.content.trim().length > 0)
+    .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
 }
 
 /* -------- broadened contact-list intent matcher -------- */
-function isContactListQuery(text=""){
-  const t=text.trim().toLowerCase();
+function isContactListQuery(text = "") {
+  const t = text.trim().toLowerCase();
   return (
     /^contacts$/.test(t) ||
     /^contact\s+list$/.test(t) ||
@@ -250,94 +304,91 @@ function isContactListQuery(text=""){
 }
 
 // ===================================================================
-export default async function handler(req, res){
-  try{
-    if (req.method==="GET"){
-      await dbg("ping",{ at:new Date().toISOString() });
+export default async function handler(req, res) {
+  try {
+    if (req.method === "GET") {
+      await dbg("ping", { at: new Date().toISOString() });
       return res.status(200).send("ping logged");
     }
-    if (req.method!=="POST") return res.status(405).send("Method Not Allowed");
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    const chunks=[]; for await (const c of req) chunks.push(c);
-    const raw=Buffer.concat(chunks).toString("utf8");
-    const p=new URLSearchParams(raw);
+    const chunks = []; for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString("utf8");
+    const p = new URLSearchParams(raw);
 
-    const rawFrom=p.get("From")||"";
-    const channel=rawFrom.startsWith("whatsapp:")?"whatsapp":"sms";
-    const from=uidFromTwilio(rawFrom);
-    const body=(p.get("Body")||"").trim();
-    const numMedia=Number(p.get("NumMedia")||0);
-    const waProfile=p.get("ProfileName")||null;
+    const rawFrom  = p.get("From") || "";
+    const channel  = rawFrom.startsWith("whatsapp:") ? "whatsapp" : "sms";
+    const from     = uidFromTwilio(rawFrom);
+    const body     = (p.get("Body") || "").trim();
+    const numMedia = Number(p.get("NumMedia") || 0);
+    const waProfile = p.get("ProfileName") || null;
 
-    await dbg("webhook_in",{ channel, from, body, numMedia });
+    await dbg("webhook_in", { channel, from, body, numMedia });
 
-    if (!from){
+    if (!from) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Missing sender</Message></Response>");
     }
 
-    if (channel==="sms" && numMedia>0){
+    if (channel === "sms" && numMedia > 0) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>");
     }
 
-    const userId=await getOrCreateUserId(from);
-    await dbg("user_identified",{ userId, from }, userId);
+    const userId = await getOrCreateUserId(from);
+    await dbg("user_identified", { userId, from }, userId);
 
-    if (waProfile){
+    if (waProfile) {
       await upsertContact({ userId, name: sanitizeName(waProfile), phone: from, channel });
     }
 
-    if (/^buy\b/i.test(body)){
+    if (/^buy\b/i.test(body)) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
-    // ---- QUICK CONTACT LIST (broad matcher; no model, no credits)
-    if (isContactListQuery(body)){
+    // ---- CONTACT LIST quick path (no model, no credits)
+    if (isContactListQuery(body)) {
       const { data: contacts, error: listErr } = await supabase
-        .from("contacts")
-        .select("name, phone")
-        .eq("user_id", userId)
-        .order("name", { ascending: true })
-        .limit(100);
+        .from("contacts").select("name, phone").eq("user_id", userId)
+        .order("name", { ascending: true }).limit(100);
 
-      let msg="No contacts saved yet.";
-      if (!listErr && Array.isArray(contacts) && contacts.length){
-        msg = contacts.map(c=>`${c.name} — ${c.phone}`).join("\n");
-      } else if (listErr){
-        await dbg("contacts_list_error",{ code:listErr.code, message:listErr.message }, userId);
-        msg="Sorry, couldn't fetch contacts right now.";
+      let msg = "No contacts saved yet.";
+      if (!listErr && Array.isArray(contacts) && contacts.length) {
+        msg = contacts.map(c => `${c.name} — ${c.phone}`).join("\n");
+      } else if (listErr) {
+        await dbg("contacts_list_error", { code: listErr.code, message: listErr.message }, userId);
+        msg = "Sorry, couldn't fetch contacts right now.";
       }
 
-      await saveTurn(userId,"user",body,channel,from);
-      await saveTurn(userId,"assistant",msg,channel,from);
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // ---- FAST contact save (regex + LLM) ----
-    let contact=parseSaveContact(body);
-    if (!contact){
-      try{
-        contact=await llmExtractContact(body);
-        if (contact) await dbg("contact_llm_extracted",contact,userId);
-      }catch(e){
-        await dbg("contact_llm_extract_error",{ message:String(e) },userId);
+    // ---- FAST contact save (regex + LLM fallback) ----
+    let contact = parseSaveContact(body);
+    if (!contact) {
+      try {
+        contact = await llmExtractContact(body);
+        if (contact) await dbg("contact_llm_extracted", contact, userId);
+      } catch (e) {
+        await dbg("contact_llm_extract_error", { message: String(e) }, userId);
       }
     }
-    if (contact){
-      const result=await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
-      const verb=result?.action==="insert_new"?"Saved":"Updated";
-      await saveTurn(userId,"user",body,channel,from);
-      await saveTurn(userId,"assistant",`${verb} ${contact.name}`,channel,from);
+    if (contact) {
+      const result = await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
+      const verb = result?.action === "insert_new" ? "Saved" : "Updated";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", `${verb} ${contact.name}`, channel, from);
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
     }
 
     // ---- credits gate ----
-    const credits=await getCredits(userId);
-    if (credits<=0){
+    const credits = await getCredits(userId);
+    if (credits <= 0) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
     }
@@ -346,56 +397,57 @@ export default async function handler(req, res){
     const { data: memRow } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
     const prior = memRow?.summary ?? blankMemory();
 
-    await dbg("wa_media_meta",{
-      channel, numMedia, mediaUrl0:p.get("MediaUrl0"), mediaType0:p.get("MediaContentType0")
+    await dbg("wa_media_meta", {
+      channel, numMedia, mediaUrl0: p.get("MediaUrl0"), mediaType0: p.get("MediaContentType0")
     }, userId);
 
-    let userMsg=body||"";
-    let visionPart=null;
-    if (channel==="whatsapp" && numMedia>0){
-      try{
-        const mediaUrl=p.get("MediaUrl0");
-        const ctype=p.get("MediaContentType0")||"image/jpeg";
-        const b64=await fetchTwilioMediaB64(mediaUrl);
-        visionPart={ type:"image_url", image_url:{ url:`data:${ctype};base64,${b64}` } };
-        if (!userMsg) userMsg="Please analyse this image.";
-      }catch(err){
-        await dbg("wa_media_fetch_error",{ message:String(err) },userId);
+    let userMsg = body || "";
+    let visionPart = null;
+    if (channel === "whatsapp" && numMedia > 0) {
+      try {
+        const mediaUrl = p.get("MediaUrl0");
+        const ctype = p.get("MediaContentType0") || "image/jpeg";
+        const b64 = await fetchTwilioMediaB64(mediaUrl);
+        // use "image_url" for chat.completions
+        visionPart = { type: "image_url", image_url: { url: `data:${ctype};base64,${b64}` } };
+        if (!userMsg) userMsg = "Please analyse this image.";
+      } catch (err) {
+        await dbg("wa_media_fetch_error", { message: String(err) }, userId);
       }
     }
 
-    await saveTurn(userId,"user",userMsg,channel,from);
+    await saveTurn(userId, "user", userMsg, channel, from);
 
-    const history=cleanHistory(await loadRecentTurns(userId,12));
-    const messages=[
-      { role:"system", content:"You are Limi. Be concise. If an image is provided, describe it and answer the question." },
+    const history = cleanHistory(await loadRecentTurns(userId, 12));
+    const messages = [
+      { role: "system", content: "You are Limi. Be concise. If an image is provided, describe it and answer the question." },
       ...history.slice(-11),
-      { role:"user", content: visionPart ? [{type:"text",text:userMsg}, visionPart] : [{type:"text",text:userMsg}] }
+      { role: "user", content: visionPart ? [{ type: "text", text: userMsg }, visionPart] : [{ type: "text", text: userMsg }] },
     ];
 
-    const completion=await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
-    const reply=completion.choices[0].message.content?.trim() || "OK";
+    const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
+    const reply = completion.choices[0].message.content?.trim() || "OK";
 
-    await saveTurn(userId,"assistant",reply,channel,from);
-    await setCredits(userId, Math.max(0, credits-1));
+    await saveTurn(userId, "assistant", reply, channel, from);
+    await setCredits(userId, Math.max(0, credits - 1));
 
-    const extracted=await extractMemory(prior, body);
-    const merged=mergeMemory(prior, extracted);
-    await supabase.from("memories").upsert({ user_id:userId, summary: merged });
+    const extracted = await extractMemory(prior, body);
+    const merged = mergeMemory(prior, extracted);
+    await supabase.from("memories").upsert({ user_id: userId, summary: merged });
 
-    const bestName=merged?.name || (waProfile ? sanitizeName(waProfile) : null) || null;
-    if (bestName){
+    const bestName = merged?.name || (waProfile ? sanitizeName(waProfile) : null) || null;
+    if (bestName) {
       await upsertContact({ userId, name: bestName, phone: from, channel });
     }
 
-    let footer="";
-    if (!merged?.name && channel==="whatsapp") footer="\n\n(What’s your first name so I can save it?)";
+    let footer = "";
+    if (!merged?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
 
     res.setHeader("Content-Type","text/xml");
-    return res.status(200).send(`<Response><Message>${escapeXml(reply+footer)}</Message></Response>`);
-  } catch(e){
-    console.error("handler fatal",e);
-    await dbg("handler_fatal",{ message:String(e?.message||e), stack:e?.stack||null });
+    return res.status(200).send(`<Response><Message>${escapeXml(reply + footer)}</Message></Response>`);
+  } catch (e) {
+    console.error("handler fatal", e);
+    await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
     res.setHeader("Content-Type","text/xml");
     return res.status(200).send("<Response><Message>Sorry, something went wrong.</Message></Response>");
   }
