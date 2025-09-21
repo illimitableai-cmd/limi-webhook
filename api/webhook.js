@@ -83,8 +83,7 @@ async function extractMemory(prior, newMsg) {
   });
   try {
     const t = c.choices[0].message.content || "{}";
-    const s = t.indexOf("{"),
-      e = t.lastIndexOf("}");
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
     return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
   } catch {
     return {};
@@ -111,9 +110,7 @@ async function upsertContact({ userId, name, phone, channel }) {
 }
 
 // ---- db helpers ----
-// NEW: race-proof + debuggable
 async function getOrCreateUserId(identifier) {
-  // 1) Try to find existing mapping
   const { data: ident, error: identErr } = await supabase
     .from("identifiers")
     .select("user_id")
@@ -125,7 +122,6 @@ async function getOrCreateUserId(identifier) {
   }
   if (ident?.user_id) return ident.user_id;
 
-  // 2) Create user
   const { data: user, error: userErr } = await supabase
     .from("users")
     .insert([{ display_name: null }])
@@ -134,7 +130,6 @@ async function getOrCreateUserId(identifier) {
 
   if (userErr) {
     await dbg("users_insert_error", { message: userErr.message, code: userErr.code, details: userErr.details });
-    // Race? Re-check identifiers then give up
     const { data: ident2 } = await supabase
       .from("identifiers")
       .select("user_id")
@@ -144,7 +139,6 @@ async function getOrCreateUserId(identifier) {
     throw userErr;
   }
 
-  // 3) Link identifier → user (handle unique/race)
   const { error: linkErr } = await supabase
     .from("identifiers")
     .insert([{ user_id: user.id, type: "phone", value: identifier }]);
@@ -197,10 +191,7 @@ function parseSaveContact(msg) {
   let name = null;
   for (const r of patterns) {
     const m = r.exec(msg);
-    if (m) {
-      name = m[1];
-      break;
-    }
+    if (m) { name = m[1]; break; }
   }
   if (!name || !phone) return null;
   name = name.trim().replace(/\s+/g, " ");
@@ -208,6 +199,17 @@ function parseSaveContact(msg) {
   if (d.startsWith("00")) d = "+" + d.slice(2);
   if (d.startsWith("0")) d = "+44" + d.slice(1);
   return { name, phone: d };
+}
+
+// ---- sanitize history for OpenAI ----
+function cleanHistory(history) {
+  const allowed = new Set(["system", "assistant", "user", "function", "tool", "developer"]);
+  return (history || [])
+    .filter((m) => m && allowed.has(m.role) && typeof m.content === "string" && m.content.trim().length > 0)
+    .map((m) => ({
+      role: m.role,
+      content: m.content.slice(0, 4000), // trim just in case
+    }));
 }
 
 // ===================================================================
@@ -248,12 +250,10 @@ export default async function handler(req, res) {
       res.setHeader("Content-Type", "text/xml");
       return res
         .status(200)
-        .send(
-          "<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>"
-        );
+        .send("<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>");
     }
 
-    // identify user (now race-proof)
+    // identify user (race-proof)
     const userId = await getOrCreateUserId(from);
     await dbg("user_identified", { userId, from }, userId);
 
@@ -265,9 +265,7 @@ export default async function handler(req, res) {
     // BUY
     if (/^buy\b/i.test(body)) {
       res.setHeader("Content-Type", "text/xml");
-      return res
-        .status(200)
-        .send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
+      return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
     // FAST PATH: save contact intent (no credits, no memory change)
@@ -277,9 +275,7 @@ export default async function handler(req, res) {
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", `Saved ${contact.name}`, channel, from);
       res.setHeader("Content-Type", "text/xml");
-      return res
-        .status(200)
-        .send(`<Response><Message>${escapeXml(`Saved ${contact.name}`)}</Message></Response>`);
+      return res.status(200).send(`<Response><Message>${escapeXml(`Saved ${contact.name}`)}</Message></Response>`);
     }
 
     // credits
@@ -292,26 +288,17 @@ export default async function handler(req, res) {
     }
 
     // load memory
-    const { data: memRow } = await supabase
-      .from("memories")
-      .select("summary")
-      .eq("user_id", userId)
-      .maybeSingle();
+    const { data: memRow } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
     const prior = memRow?.summary ?? blankMemory();
 
     // media logging
     await dbg(
       "wa_media_meta",
-      {
-        channel,
-        numMedia,
-        mediaUrl0: p.get("MediaUrl0"),
-        mediaType0: p.get("MediaContentType0"),
-      },
+      { channel, numMedia, mediaUrl0: p.get("MediaUrl0"), mediaType0: p.get("MediaContentType0") },
       userId
     );
 
-    // build user content
+    // build user content for this turn
     let userMsg = body || "";
     let visionPart = null;
     if (channel === "whatsapp" && numMedia > 0) {
@@ -329,13 +316,10 @@ export default async function handler(req, res) {
     // save inbound
     await saveTurn(userId, "user", userMsg, channel, from);
 
-    // context + model
-    const history = await loadRecentTurns(userId, 12);
+    // context + model (SANITIZED HISTORY)
+    const history = cleanHistory(await loadRecentTurns(userId, 12));
     const messages = [
-      {
-        role: "system",
-        content: "You are Limi. Be concise. If an image is provided, describe it and answer the question.",
-      },
+      { role: "system", content: "You are Limi. Be concise. If an image is provided, describe it and answer the question." },
       ...history.slice(-11),
       { role: "user", content: visionPart ? [{ type: "text", text: userMsg }, visionPart] : [{ type: "text", text: userMsg }] },
     ];
