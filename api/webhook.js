@@ -179,26 +179,71 @@ async function setCredits(userId, balance) {
   await supabase.from("credits").upsert({ user_id: userId, balance });
 }
 
-// ---- contact intent (no credits, no memory change) ----
+/** ------------------------------------------------------------------
+ * Improved contact parsing (regex first, “as contact” tolerated,
+ * “save <name> <phone>” also supported)
+ -------------------------------------------------------------------*/
 function parseSaveContact(msg) {
-  const phone = (msg.match(/(\+?\d[\d\s()+-]{6,})/g) || [])[0];
+  const text = (msg || "").trim();
+  const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
+  const rawPhone = phoneMatch ? phoneMatch[1] : null;
+
   const patterns = [
-    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact/i,
-    /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})\s+as\s+a\s+contact/i,
-    /save\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
-    /add\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,40})/i,
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
+    /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
+    /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
+    /save\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
+    /add\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
+    // “save <name>, <phone>” or “save <name> <phone>”
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})[\s,]+(\+?\d[\d\s().-]{6,})/i,
   ];
+
   let name = null;
-  for (const r of patterns) {
-    const m = r.exec(msg);
-    if (m) { name = m[1]; break; }
+  let phone = rawPhone;
+
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (!m) continue;
+    if (m[2]) phone = m[2];
+    if (m[1]) name  = m[1];
+    break;
   }
+
   if (!name || !phone) return null;
-  name = name.trim().replace(/\s+/g, " ");
+
+  name = name.trim().replace(/\s+/g, " ").toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+
   let d = phone.replace(/[^\d+]/g, "");
   if (d.startsWith("00")) d = "+" + d.slice(2);
   if (d.startsWith("0")) d = "+44" + d.slice(1);
+
   return { name, phone: d };
+}
+
+/** LLM fallback extractor (used only if regex path fails; still pre-credits) */
+async function llmExtractContact(msg) {
+  const sys = "Return ONLY compact JSON like {\"name\":\"...\",\"phone\":\"...\"} if the text asks to save/add a contact; otherwise {}. Phone must include country code (e.g., +447...).";
+  const user = `Text: ${msg}`;
+  const c = await safeChatCompletion({
+    model: MEMORY_MODEL,
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    temperature: 0,
+    max_tokens: 80
+  });
+  try {
+    const t = c.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    const j = JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+    if (j?.name && j?.phone) {
+      const name = j.name.trim().replace(/\s+/g, " ").toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+      let d = String(j.phone).replace(/[^\d+]/g, "");
+      if (d.startsWith("00")) d = "+" + d.slice(2);
+      if (d.startsWith("0")) d = "+44" + d.slice(1);
+      return { name, phone: d };
+    }
+  } catch {}
+  return null;
 }
 
 // ---- sanitize history for OpenAI ----
@@ -208,7 +253,7 @@ function cleanHistory(history) {
     .filter((m) => m && allowed.has(m.role) && typeof m.content === "string" && m.content.trim().length > 0)
     .map((m) => ({
       role: m.role,
-      content: m.content.slice(0, 4000), // trim just in case
+      content: m.content.slice(0, 4000),
     }));
 }
 
@@ -269,7 +314,15 @@ export default async function handler(req, res) {
     }
 
     // FAST PATH: save contact intent (no credits, no memory change)
-    const contact = parseSaveContact(body);
+    let contact = parseSaveContact(body);
+    if (!contact) {
+      try {
+        contact = await llmExtractContact(body);
+        if (contact) await dbg("contact_llm_extracted", contact, userId);
+      } catch (e) {
+        await dbg("contact_llm_extract_error", { message: String(e) }, userId);
+      }
+    }
     if (contact) {
       await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
       await saveTurn(userId, "user", body, channel, from);
