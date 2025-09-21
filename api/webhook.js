@@ -90,13 +90,45 @@ async function extractMemory(prior, newMsg) {
   }
 }
 
-// ---- contacts helper (smart dedupe: by phone, then by name) ----
+/* ------------------------------------------------------------------
+   NEW: Name/phone utilities (sanitize, choose better, normalize)
+-------------------------------------------------------------------*/
+function sanitizeName(raw = "") {
+  let n = String(raw)
+    .replace(/['’]\s*s\b/gi, "")                       // drop possessive
+    .replace(/\b(number|mobile|cell|phone)\b/gi, "")   // drop label words
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  n = n.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  return n;
+}
+function isBadName(name = "") {
+  return (
+    /\b(number|mobile|cell|phone)\b/i.test(name) ||
+    /['’]\s*s\b/i.test(name) ||
+    name.replace(/[^a-z]/gi, "").length < 2
+  );
+}
+function betterName(existing = "", incoming = "") {
+  const aBad = isBadName(existing);
+  const bBad = isBadName(incoming);
+  if (bBad && !aBad) return existing;
+  if (!bBad && aBad) return incoming;
+  const aTok = (existing || "").trim().split(/\s+/).length;
+  const bTok = (incoming || "").trim().split(/\s+/).length;
+  return bTok >= aTok ? incoming : existing;
+}
+function normalizePhone(phone = "") {
+  let d = String(phone).replace(/[^\d+]/g, "");
+  if (d.startsWith("00")) d = "+" + d.slice(2);
+  if (d.startsWith("0")) d = "+44" + d.slice(1); // UK default
+  return d;
+}
+
+// ---- contacts helper (smart dedupe: by phone, then by name; keep best name) ----
 async function upsertContact({ userId, name, phone, channel }) {
-  const tidyName = (name || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  const tidyIncoming = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
 
   try {
     // 1) Already have this phone?
@@ -104,7 +136,7 @@ async function upsertContact({ userId, name, phone, channel }) {
       .from("contacts")
       .select("id, name, phone, channel")
       .eq("user_id", userId)
-      .eq("phone", phone)
+      .eq("phone", normPhone)
       .maybeSingle();
 
     if (selPhoneErr) {
@@ -112,19 +144,20 @@ async function upsertContact({ userId, name, phone, channel }) {
     }
 
     if (byPhone) {
+      const finalName = betterName(byPhone.name || "", tidyIncoming);
       const needsUpdate =
-        (byPhone.name || "") !== tidyName || (byPhone.channel || "") !== (channel || "");
+        finalName !== (byPhone.name || "") || (byPhone.channel || "") !== (channel || "");
       if (needsUpdate) {
         const { error: upErr } = await supabase
           .from("contacts")
-          .update({ name: tidyName, channel })
+          .update({ name: finalName, channel })
           .eq("id", byPhone.id);
         if (upErr) {
           await dbg("contact_update_error", { code: upErr.code, message: upErr.message }, userId);
           return { ok: false, error: upErr };
         }
       }
-      await dbg("contact_upsert_ok", { action: "update_by_phone", name: tidyName, phone, channel }, userId);
+      await dbg("contact_upsert_ok", { action: "update_by_phone", name: finalName, phone: normPhone, channel }, userId);
       return { ok: true, action: "update_by_phone" };
     }
 
@@ -133,40 +166,40 @@ async function upsertContact({ userId, name, phone, channel }) {
       .from("contacts")
       .select("id, name, phone, channel")
       .eq("user_id", userId)
-      .ilike("name", tidyName); // case-insensitive
+      .ilike("name", tidyIncoming);
 
     if (selNameErr) {
       await dbg("contact_select_name_error", { code: selNameErr.code, message: selNameErr.message }, userId);
     }
 
     const existingByName = (byName || []).find(
-      (r) => (r.name || "").trim().toLowerCase() === tidyName.toLowerCase()
+      (r) => (r.name || "").trim().toLowerCase() === tidyIncoming.toLowerCase()
     );
 
     if (existingByName) {
       const { error: upErr2 } = await supabase
         .from("contacts")
-        .update({ phone, channel })
+        .update({ phone: normPhone, channel })
         .eq("id", existingByName.id);
       if (upErr2) {
         await dbg("contact_update_conflict", { code: upErr2.code, message: upErr2.message }, userId);
         return { ok: false, error: upErr2 };
       }
-      await dbg("contact_upsert_ok", { action: "update_by_name", name: tidyName, phone, channel }, userId);
+      await dbg("contact_upsert_ok", { action: "update_by_name", name: existingByName.name, phone: normPhone, channel }, userId);
       return { ok: true, action: "update_by_name" };
     }
 
     // 3) Insert new
     const { error: insErr } = await supabase
       .from("contacts")
-      .insert({ user_id: userId, name: tidyName, phone, channel });
+      .insert({ user_id: userId, name: tidyIncoming, phone: normPhone, channel });
 
     if (insErr) {
-      await dbg("contact_insert_error", { code: insErr.code, message: insErr.message, phone, name: tidyName }, userId);
+      await dbg("contact_insert_error", { code: insErr.code, message: insErr.message, phone: normPhone, name: tidyIncoming }, userId);
       return { ok: false, error: insErr };
     }
 
-    await dbg("contact_upsert_ok", { action: "insert_new", name: tidyName, phone, channel }, userId);
+    await dbg("contact_upsert_ok", { action: "insert_new", name: tidyIncoming, phone: normPhone, channel }, userId);
     return { ok: true, action: "insert_new" };
   } catch (e) {
     await dbg("contact_upsert_exception", { message: String(e?.message || e) }, userId);
@@ -245,15 +278,21 @@ async function setCredits(userId, balance) {
 }
 
 /** ------------------------------------------------------------------
- * Improved contact parsing (regex first, “as contact” tolerated,
- * “save <name> <phone>” also supported)
+ * Improved contact parsing (regex supports possessives, etc.)
  -------------------------------------------------------------------*/
 function parseSaveContact(msg) {
   const text = (msg || "").trim();
+
+  // Extract any phone first
   const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
-  const rawPhone = phoneMatch ? phoneMatch[1] : null;
+  let phone = phoneMatch ? phoneMatch[1] : null;
 
   const patterns = [
+    // possessive with explicit phone: "save Ashley's number is 07..." / "Ashley's phone: 07..."
+    /(?:save|add)?\s*([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*['’]\s*s\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
+    // "save Ashley number 07..."
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
+    // your existing shapes
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
     /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
@@ -265,7 +304,6 @@ function parseSaveContact(msg) {
   ];
 
   let name = null;
-  let phone = rawPhone;
 
   for (const re of patterns) {
     const m = re.exec(text);
@@ -277,13 +315,11 @@ function parseSaveContact(msg) {
 
   if (!name || !phone) return null;
 
-  name = name.trim().replace(/\s+/g, " ").toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+  const tidyName = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
+  if (isBadName(tidyName)) return null;
 
-  let d = phone.replace(/[^\d+]/g, "");
-  if (d.startsWith("00")) d = "+" + d.slice(2);
-  if (d.startsWith("0")) d = "+44" + d.slice(1);
-
-  return { name, phone: d };
+  return { name: tidyName, phone: normPhone };
 }
 
 /** LLM fallback extractor (used only if regex path fails; still pre-credits) */
@@ -301,11 +337,11 @@ async function llmExtractContact(msg) {
     const s = t.indexOf("{"), e = t.lastIndexOf("}");
     const j = JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
     if (j?.name && j?.phone) {
-      const name = j.name.trim().replace(/\s+/g, " ").toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
-      let d = String(j.phone).replace(/[^\d+]/g, "");
-      if (d.startsWith("00")) d = "+" + d.slice(2);
-      if (d.startsWith("0")) d = "+44" + d.slice(1);
-      return { name, phone: d };
+      const tidyName = sanitizeName(j.name);
+      const normPhone = normalizePhone(String(j.phone));
+      if (!isBadName(tidyName)) {
+        return { name: tidyName, phone: normPhone };
+      }
     }
   } catch {}
   return null;
@@ -369,7 +405,7 @@ export default async function handler(req, res) {
 
     // auto WA profile -> contacts (non-destructive)
     if (waProfile) {
-      await upsertContact({ userId, name: waProfile, phone: from, channel });
+      await upsertContact({ userId, name: sanitizeName(waProfile), phone: from, channel });
     }
 
     // BUY
@@ -389,11 +425,12 @@ export default async function handler(req, res) {
       }
     }
     if (contact) {
-      await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
+      const result = await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
+      const verb = result?.action === "insert_new" ? "Saved" : "Updated";
       await saveTurn(userId, "user", body, channel, from);
-      await saveTurn(userId, "assistant", `Saved ${contact.name}`, channel, from);
+      await saveTurn(userId, "assistant", `${verb} ${contact.name}`, channel, from);
       res.setHeader("Content-Type", "text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(`Saved ${contact.name}`)}</Message></Response>`);
+      return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
     }
 
     // credits
@@ -460,7 +497,7 @@ export default async function handler(req, res) {
     await supabase.from("memories").upsert({ user_id: userId, summary: merged });
 
     // keep contacts in sync with best user name if we have one
-    const bestName = merged?.name || waProfile || null;
+    const bestName = merged?.name || (waProfile ? sanitizeName(waProfile) : null) || null;
     if (bestName) {
       await upsertContact({ userId, name: bestName, phone: from, channel });
     }
