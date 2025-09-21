@@ -248,7 +248,7 @@ async function setCredits(userId, balance) {
   await supabase.from("credits").upsert({ user_id: userId, balance });
 }
 
-/* === NEW: ensure a credits row exists, seed if missing === */
+/* === ensure a credits row exists, seed if missing === */
 async function ensureCredits(userId) {
   const { data, error } = await supabase
     .from("credits")
@@ -267,7 +267,6 @@ async function ensureCredits(userId) {
 
     if (insErr) {
       await dbg("credits_insert_error", { code: insErr.code, message: insErr.message }, userId);
-      // Fall back to treating as zero if insert fails
       return 0;
     }
 
@@ -346,7 +345,7 @@ function cleanHistory(history) {
 
 /* -------- broadened contact-list intent matcher -------- */
 function isContactListQuery(text = "") {
-  const t = text.trim().toLowerCase();
+  const t = (text || "").trim().toLowerCase();
   return (
     /^contacts$/.test(t) ||
     /^contact\s+list$/.test(t) ||
@@ -354,7 +353,10 @@ function isContactListQuery(text = "") {
     /^show\s+contacts$/.test(t) ||
     /(^|\b)(show|list|see|view|display)\s+(my\s+)?contacts(\b|$)/i.test(text) ||
     /(^|\b)can\s+i\s+have\s+(my\s+)?contact\s+list(\b|$)/i.test(text) ||
-    /(^|\b)contacts\s+please(\b|$)/i.test(text)
+    /(^|\b)contacts\s+please(\b|$)/i.test(text) ||
+    /\bwhat('?| i)?s?\s+my\s+contact\s+list\??$/i.test(text) || // NEW
+    /\bwhat\s+is\s+my\s+contact\s+list\??$/i.test(text) ||      // NEW
+    /\bwho\s+is\s+in\s+my\s+contacts\??$/i.test(text)           // NEW
   );
 }
 
@@ -451,8 +453,8 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
     }
 
-    // === CREDITS GATE (auto-seed if missing) ===
-    const credits = await ensureCredits(userId); // <-- ensures row exists
+    // === CREDITS GATE (auto-seed if missing)
+    const credits = await ensureCredits(userId);
     if (credits <= 0) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
@@ -473,7 +475,6 @@ export default async function handler(req, res) {
         const mediaUrl = p.get("MediaUrl0");
         const ctype = p.get("MediaContentType0") || "image/jpeg";
         const b64 = await fetchTwilioMediaB64(mediaUrl);
-        // use "image_url" for chat.completions
         visionPart = { type: "image_url", image_url: { url: `data:${ctype};base64,${b64}` } };
         if (!userMsg) userMsg = "Please analyse this image.";
       } catch (err) {
@@ -484,18 +485,21 @@ export default async function handler(req, res) {
     await saveTurn(userId, "user", userMsg, channel, from);
 
     const history = cleanHistory(await loadRecentTurns(userId, 12));
+    // Use a string unless we actually have an image
+    const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
+
     const messages = [
       { role: "system", content: "You are Limi. Be concise. If an image is provided, describe it and answer the question." },
       ...history.slice(-11),
-      { role: "user", content: visionPart ? [{ type: "text", text: userMsg }, visionPart] : [{ type: "text", text: userMsg }] },
+      { role: "user", content: userContent },
     ];
 
     const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
     const reply = completion.choices[0].message.content?.trim() || "OK";
+    await dbg("reply_out", { channel, to: from, reply }, userId); // log the final reply
 
     await saveTurn(userId, "assistant", reply, channel, from);
-    // simple debit (MVP): reduce by 1
-    await setCredits(userId, Math.max(0, credits - 1));
+    await setCredits(userId, Math.max(0, credits - 1)); // simple debit
 
     const extracted = await extractMemory(prior, body);
     const merged = mergeMemory(prior, extracted);
