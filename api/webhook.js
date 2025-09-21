@@ -27,16 +27,21 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
 function escapeXml(s = "") {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
+// UPDATED: normalize to canonical E.164 so SMS & WhatsApp map to the same user
 function uidFromTwilio(from = "") {
-  return from.replace(/^whatsapp:/i, "").replace(/^sms:/i, "").trim();
+  let v = from.replace(/^whatsapp:/i, "").replace(/^sms:/i, "").trim();
+  v = v.replace(/[^\d+]/g, "");        // strip spaces, -, ()
+  if (v.startsWith("00")) v = "+" + v.slice(2);
+  if (v.startsWith("0")) v = "+44" + v.slice(1); // UK default
+  return v;
 }
+
 async function dbg(step, payload, userId = null) {
-  try {
-    await supabase.from("debug_logs").insert([{ step, payload, user_id: userId }]);
-  } catch (e) {
-    console.error("dbg fail", e);
-  }
+  try { await supabase.from("debug_logs").insert([{ step, payload, user_id: userId }]); }
+  catch (e) { console.error("dbg fail", e); }
 }
+
 async function fetchTwilioMediaB64(url) {
   const basic = Buffer.from(`${process.env.TWILIO_SID}:${process.env.TWILIO_AUTH}`).toString("base64");
   const r = await fetch(url, { headers: { Authorization: `Basic ${basic}` } });
@@ -91,7 +96,7 @@ async function extractMemory(prior, newMsg) {
 }
 
 /* ------------------------------------------------------------------
-   NEW: Name/phone utilities (sanitize, choose better, normalize)
+   Name/phone utilities (sanitize, choose better, normalize)
 -------------------------------------------------------------------*/
 function sanitizeName(raw = "") {
   let n = String(raw)
@@ -461,7 +466,8 @@ export default async function handler(req, res) {
         const mediaUrl = p.get("MediaUrl0");
         const ctype = p.get("MediaContentType0") || "image/jpeg";
         const b64 = await fetchTwilioMediaB64(mediaUrl);
-        visionPart = { type: "input_image", image_url: { url: `data:${ctype};base64,${b64}` } };
+        // UPDATED: use "image_url" (supported) instead of "input_image"
+        visionPart = { type: "image_url", image_url: { url: `data:${ctype};base64,${b64}` } };
         if (!userMsg) userMsg = "Please analyse this image.";
       } catch (err) {
         await dbg("wa_media_fetch_error", { message: String(err) }, userId);
