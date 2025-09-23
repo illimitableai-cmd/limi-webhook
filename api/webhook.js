@@ -17,7 +17,7 @@ const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 // FREE TRIAL amount used when we first see a user with no credits row
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 
-/** GPT-5: use max_completion_tokens and omit temperature; others use legacy params */
+// ===== Core model wrapper (kept) =====
 async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.4, maxTokens = 180 }) {
   const isGpt5 = /^gpt-5/i.test(model);
   const args = { model, messages };
@@ -81,22 +81,28 @@ function blankMemory() {
     interests: [],
     goals: [],
     notes: [],
+    // NEW: rolling conversation summary (string)
+    convo_summary: "",
     last_seen: new Date().toISOString(),
   };
 }
 
 function mergeMemory(oldMem, add) {
   const m = { ...blankMemory(), ...(oldMem || {}) };
-  for (const k of ["name","location","email","birthday","timezone"]) if (add?.[k]) m[k] = add[k];
+  for (const k of ["name","location","email","birthday","timezone","convo_summary"]) {
+    if (add?.[k] && typeof add[k] === "string") m[k] = add[k];
+  }
   m.preferences = { ...(oldMem?.preferences || {}), ...(add?.preferences || {}) };
   const dedupe = (a) => Array.from(new Set((a || []).filter(Boolean))).slice(0, 12);
   m.interests = dedupe([...(oldMem?.interests || []), ...(add?.interests || [])]);
   m.goals = dedupe([...(oldMem?.goals || []), ...(add?.goals || [])]);
-  m.notes = dedupe([...(oldMem?.notes || []), ...(add?.notes || [])]);
+  // Keep up to 20 short notes max
+  m.notes = dedupe([...(oldMem?.notes || []), ...(add?.notes || [])]).slice(0, 20);
   m.last_seen = new Date().toISOString();
   return m;
 }
 
+/** Extract long-lived, profile-style memory from user text */
 async function extractMemory(prior, newMsg) {
   const sys =
     "Return ONLY JSON of long-lived user facts to remember: " +
@@ -117,6 +123,22 @@ async function extractMemory(prior, newMsg) {
   }
 }
 
+/** NEW: Summarise conversation so far into a compact rolling summary */
+async function summariseConversation({ priorSummary = "", history = [], latestUser }) {
+  // Keep it short and useful for future turns
+  const sys =
+    "You maintain a rolling, 5-7 line concise summary of this user's ongoing conversation with Limi. " +
+    "Capture: current topic(s), decisions made, open questions, and next likely steps. " +
+    "Be specific but brief; UK spelling; no fluff. Return ONLY the updated summary text.";
+  const textHistory = history.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
+  const messages = [
+    { role: "system", content: sys },
+    { role: "user", content: `Prior summary:\n${priorSummary || "(none)"}\n\nRecent messages:\n${textHistory}\n\nLatest user message:\n${latestUser}\n\nUpdate the summary now:` }
+  ];
+  const c = await safeChatCompletion({ model: MEMORY_MODEL, messages, maxTokens: 220 });
+  return (c.choices?.[0]?.message?.content || "").trim().slice(0, 1500);
+}
+
 /** Compact memory snapshot for prompting */
 function memorySnapshotForPrompt(mem) {
   if (!mem) return "None";
@@ -124,43 +146,55 @@ function memorySnapshotForPrompt(mem) {
   if (mem.name) parts.push(`name: ${mem.name}`);
   if (mem.location) parts.push(`location: ${mem.location}`);
   if (mem.timezone) parts.push(`timezone: ${mem.timezone}`);
-
   const prefs     = mem.preferences && Object.keys(mem.preferences).length ? `preferences: ${JSON.stringify(mem.preferences)}` : null;
   const interests = mem.interests && mem.interests.length ? `interests: ${mem.interests.slice(0,6).join(", ")}` : null;
   const goals     = mem.goals && mem.goals.length ? `goals: ${mem.goals.slice(0,4).join(", ")}` : null;
   const notes     = mem.notes && mem.notes.length ? `notes: ${mem.notes.slice(0,4).join("; ")}` : null;
-
   [prefs, interests, goals, notes].forEach(x => { if (x) parts.push(x); });
+  if (mem.convo_summary) parts.push(`conversation summary: ${mem.convo_summary.slice(0, 600)}`);
   return parts.length ? parts.join(" • ") : "None";
 }
 
-/** Friendly UK persona + behaviour */
+/** Friendly UK persona + behaviour (expanded) */
 function buildSystemPrompt(prior) {
   const snapshot = memorySnapshotForPrompt(prior);
   return [
-    "You are Limi, a warm, concise WhatsApp/SMS assistant. Use UK spelling.",
-    "Style: friendly, to-the-point, no waffle; 1–2 sentences when possible.",
-    "If an image is provided, describe briefly only if helpful, then answer.",
-    "Use the user's profile when it helps. Address them by name if known.",
-    "Ask at most ONE short, natural follow-up question when it clearly adds value.",
-    "If the user gave info (not a question), acknowledge it briefly and offer next helpful step.",
-    "Avoid generic replies like 'OK' or 'Sure'.",
+    "You are Limi, a warm, concise WhatsApp/SMS assistant. Use UK spelling and a natural, human tone.",
+    "Style: friendly and to-the-point; use short paragraphs and tidy bullets for dense facts.",
+    "Keep answers self-contained but context-aware; rely on the rolling conversation summary when helpful.",
+    "Ask at most ONE short, natural follow-up if it clearly helps the user make progress.",
+    "If the user states info (not a question), acknowledge briefly and offer a practical next step.",
+    "Avoid generic non-answers like 'OK' or 'Sure'.",
+    "Where numbers/lists help clarity, use simple bullets or 1) 2) 3). Keep SMS-friendly line lengths.",
     `User profile snapshot: ${snapshot}`
   ].join("\n");
 }
 
-/** Post-process to avoid dull replies and add micro follow-ups without extra API calls */
+/** Lively micro follow-ups: 0–2 short suggestions tailored to the last reply */
+async function suggestFollowUps({ userMsg, assistantReply }) {
+  const sys =
+    "Suggest up to TWO tiny follow-up options that would help the user take the next step. " +
+    "Return ONLY plain text with each option on a new line, written as a question or 'I can…' offer. " +
+    "Keep each to ~6 words. If none are useful, return an empty string.";
+  const messages = [
+    { role: "system", content: sys },
+    { role: "user", content: `User said: ${userMsg}\nAssistant replied:\n${assistantReply}\n\nNow suggest follow-ups:` }
+  ];
+  const c = await safeChatCompletion({ model: MEMORY_MODEL, messages, maxTokens: 80 });
+  const text = (c.choices?.[0]?.message?.content || "").trim();
+  const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(0, 2);
+  return lines;
+}
+
+/** Post-process to avoid dull replies; fallbacks remain */
 function postProcessReply(reply, userMsg, prior) {
   const r = (reply || "").trim();
   const lower = r.toLowerCase();
   const tooShort = r.length < 8 || ["ok", "okay", "k", "sure", "noted"].includes(lower);
-  // Keep admin-style answers short but not "OK"
   const adminy = /\b(emergency|contact|contacts|buy|help|settings?)\b/i.test(userMsg);
   if (!tooShort) return r;
   const name = prior?.name ? prior.name : null;
-  if (adminy) {
-    return name ? `All set, ${name}.` : "All set.";
-  }
+  if (adminy) return name ? `All set, ${name}.` : "All set.";
   const ack = name ? `Got it, ${name}.` : "Got it.";
   const ask = "Anything else you’d like me to sort out?";
   return `${ack} ${ask}`;
@@ -214,7 +248,7 @@ function prettyPhone(p = "") {
   return `+${cc} ${chunks.reverse().join(" ")}`;
 }
 
-/* ---------- DIRECT SEND HELPER (new) ---------- */
+/* ---------- DIRECT SEND HELPER ---------- */
 async function sendDirect({ channel, to, body }) {
   try {
     if (channel === "whatsapp") {
@@ -319,7 +353,7 @@ async function getOrCreateUserId(identifier) {
   return user.id;
 }
 
-async function loadRecentTurns(userId, limit = 12) {
+async function loadRecentTurns(userId, limit = 30) {
   const { data } = await supabase
     .from("messages").select("role, body").eq("user_id", userId)
     .order("created_at", { ascending: false }).limit(limit);
@@ -338,16 +372,11 @@ async function setCredits(userId, balance) {
   await supabase.from("credits").upsert({ user_id: userId, balance });
 }
 
-/* === ensure a credits row exists, seed if missing === */
+/** ensure credits row exists, seed if missing */
 async function ensureCredits(userId) {
   const { data, error } = await supabase
-    .from("credits")
-    .select("balance")
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (error) {
-    await dbg("credits_select_error", { code: error.code, message: error.message }, userId);
-  }
+    .from("credits").select("balance").eq("user_id", userId).maybeSingle();
+  if (error) await dbg("credits_select_error", { code: error.code, message: error.message }, userId);
   if (!data) {
     const { error: insErr } = await supabase
       .from("credits")
@@ -475,8 +504,7 @@ function extractNameQuick(text = "") {
   return null;
 }
 
-/* ===================== EMERGENCY CONTACTS ===================== */
-/** Natural-language emergency intent extractor (free, tiny response) */
+/* ===================== EMERGENCY CONTACTS (kept) ===================== */
 async function emgExtractNatural(text = "") {
   const sys =
     'Return ONLY compact JSON like {"intent":"add|remove|list|none","name":"...","phone":"...","channel":"sms|whatsapp|both"}.' +
@@ -504,13 +532,10 @@ async function listEmergencyContacts(userId) {
     .select("name, phone, channel")
     .eq("user_id", userId)
     .order("name", { ascending: true });
-  if (error) {
-    await dbg("emg_list_error", { code: error.code, msg: error.message }, userId);
-  }
+  if (error) await dbg("emg_list_error", { code: error.code, msg: error.message }, userId);
   return (data || []);
 }
 
-/** Upsert by PHONE first (prevents duplicates), else insert */
 async function upsertEmergencyContact({ userId, name, phone, channel = "both" }) {
   const tidyName = sanitizeName(name);
   const normPhone = normalizePhone(phone);
@@ -605,12 +630,9 @@ async function sendEmergencyAlert({ userId, from }) {
 }
 
 /* ---- emergency command parsing (kept for power users) ---- */
-/* UPDATED: accept both orders (name→phone) and (phone→name) */
 function parseAddEmergency(text = "") {
   const t = text.trim();
-  // Pattern A: name THEN phone
   const reA = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
-  // Pattern B: phone THEN name
   const reB = /add\s+emergency\s+contact\s+(\+?\d[\d\s().-]{6,})\s+([a-z][a-z\s'’-]{1,60})(?:\s+(sms|whatsapp|both))?$/i;
 
   let m = t.match(reA);
@@ -638,31 +660,16 @@ function parseRemoveEmergency(text="") {
   return m ? sanitizeName(m[1]) : null;
 }
 
-/* -------- broadened emergency-contact list intent matcher (like normal contacts) -------- */
 function isEmergencyContactListQuery(text = "") {
   const t = (text || "").trim();
-
-  // Exact short forms
   if (/^\s*(emergency\s+contacts|ice\s+contacts)\s*$/i.test(t)) return true;
-
-  // Common phrasings
   if (/(^|\b)(show|list|see|view|display)\s+(my\s+)?(emergency|ice)\s+contacts(\b|$)/i.test(t)) return true;
   if (/(^|\b)can\s+i\s+have\s+(my\s+)?(emergency|ice)\s+contacts(\b|$)/i.test(t)) return true;
-
-  // Questions
   if (/\bwho\s+is\s+in\s+my\s+(emergency|ice)\s+contacts\??$/i.test(t)) return true;
   if (/\bwhat('?| i)?s?\s+my\s+(emergency|ice)\s+contact\s+list\??$/i.test(t)) return true;
   if (/\bwhat\s+is\s+my\s+(emergency|ice)\s+contact\s+list\??$/i.test(t)) return true;
-
-  // “In case of emergency” phrasing
   if (/(^|\b)(in\s+case\s+of\s+)?emergency\s+contact(s)?\s+list(\b|$)/i.test(t)) return true;
-
   return false;
-}
-
-// Back-compat shim so any old calls still work:
-function isEmergencyList(text = "") {
-  return isEmergencyContactListQuery(text);
 }
 
 function isHelpTrigger(text="") {
@@ -703,7 +710,7 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>");
     }
 
-    // Ensure we have a user row
+    // Ensure user row
     const userId = await getOrCreateUserId(from);
     await dbg("user_identified", { userId, from }, userId);
 
@@ -717,7 +724,7 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
-    // --- QUICK NAME SAVE (no model, no credits) ---
+    // --- QUICK NAME SAVE (no model, no credits)
     const quickName = extractNameQuick(body);
     if (quickName) {
       const { data: memRow0 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
@@ -748,7 +755,7 @@ export default async function handler(req, res) {
 
     /* ==================== EMERGENCY: natural-language router (free) ==================== */
     const emgNLU = await emgExtractNatural(body);
-    await dbg("emg_nlu", emgNLU, userId); // log what NLU extracted
+    await dbg("emg_nlu", emgNLU, userId);
 
     if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
       if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
@@ -826,10 +833,9 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response/>");
     }
 
-    // ==== NEW: broadened EMERGENCY LIST quick path (no model, no credits)
+    // ==== EMERGENCY LIST quick path (no model, no credits)
     if (isEmergencyContactListQuery(body)) {
       const list = await listEmergencyContacts(userId);
-
       let msg = "You have no emergency contacts yet.";
       if (list.length) {
         const rows = list.map(c => {
@@ -842,10 +848,8 @@ export default async function handler(req, res) {
       } else {
         msg += " Add one like: add emergency contact Alex +447700900000 sms";
       }
-
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", msg, channel, from);
-
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
@@ -947,38 +951,79 @@ export default async function handler(req, res) {
 
     await saveTurn(userId, "user", userMsg, channel, from);
 
-    const history = cleanHistory(await loadRecentTurns(userId, 12));
+    // ===== Load richer context =====
+    const history = cleanHistory(await loadRecentTurns(userId, 40));
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
     const messages = [
-      { role: "system", content: buildSystemPrompt(prior) }, // richer persona + memory snapshot
-      ...history.slice(-11),
+      { role: "system", content: buildSystemPrompt(prior) },
+      ...history.slice(-15), // last 15 turns verbatim
       { role: "user", content: userContent },
     ];
 
-    const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
-
+    // ===== Main answer =====
+    const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 });
     let reply = completion.choices[0].message.content?.trim() || "OK";
-    reply = postProcessReply(reply, userMsg, prior); // avoid dull “OK”, add tiny follow-up if needed
+    reply = postProcessReply(reply, userMsg, prior);
 
-    await dbg("reply_out", { channel, to: from, reply }, userId);
-
-    await saveTurn(userId, "assistant", reply, channel, from);
-    await setCredits(userId, Math.max(0, credits - 1));
-
-    const extracted = await extractMemory(prior, body);
-    const merged = mergeMemory(prior, extracted);
-    await supabase.from("memories").upsert({ user_id: userId, summary: merged });
-
-    const bestName = merged?.name || (waProfile ? sanitizeName(waProfile) : null) || null;
-    if (bestName) {
-      await upsertContact({ userId, name: bestName, phone: from, channel });
+    // ===== Optional micro follow-ups (cheap, short) =====
+    let followLines = [];
+    try {
+      // Only bother if the reply is not a pure acknowledgement
+      if (!/^all set|got it/i.test(reply)) {
+        followLines = await suggestFollowUps({ userMsg, assistantReply: reply });
+      }
+    } catch (e) {
+      await dbg("followup_suggest_error", { message: String(e) }, userId);
     }
 
+    // Compose final message with follow-ups, staying SMS-friendly
+    let finalReply = reply;
+    if (followLines.length) {
+      finalReply += "\n\nWould you like me to:\n" + followLines.map((l, i) => `${i+1}) ${l}`).join("\n");
+      // Keep under ~1200 chars to be safe on platforms that split long messages
+      if (finalReply.length > 1200) finalReply = finalReply.slice(0, 1190) + "…";
+    }
+
+    await dbg("reply_out", { channel, to: from, reply: finalReply }, userId);
+
+    await saveTurn(userId, "assistant", finalReply, channel, from);
+    await setCredits(userId, Math.max(0, credits - 1));
+
+    // ===== Update rolling conversation summary (so Limi "remembers the chat", not just facts)
+    try {
+      const slimHistory = history.slice(-10); // summarise last handful + latest
+      const newSummary = await summariseConversation({
+        priorSummary: prior.convo_summary || "",
+        history: slimHistory,
+        latestUser: userMsg
+      });
+      const mergedForSummary = mergeMemory(prior, { convo_summary: newSummary });
+      await supabase.from("memories").upsert({ user_id: userId, summary: mergedForSummary });
+    } catch (e) {
+      await dbg("convo_summary_error", { message: String(e) }, userId);
+    }
+
+    // ===== Extract long-lived profile memory from user message
+    try {
+      const extracted = await extractMemory(prior, body);
+      if (extracted && Object.keys(extracted).length) {
+        const merged = mergeMemory(memRow?.summary ?? blankMemory(), extracted);
+        await supabase.from("memories").upsert({ user_id: userId, summary: merged });
+
+        const bestName = merged?.name || (waProfile ? sanitizeName(waProfile) : null) || null;
+        if (bestName) await upsertContact({ userId, name: bestName, phone: from, channel });
+      }
+    } catch (e) {
+      await dbg("memory_extract_error", { message: String(e) }, userId);
+    }
+
+    // Gentle name nudge for WA if unknown
     let footer = "";
-    if (!merged?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
+    const latestMem = (await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle()).data?.summary;
+    if (!latestMem?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
 
     res.setHeader("Content-Type","text/xml");
-    return res.status(200).send(`<Response><Message>${escapeXml(reply + footer)}</Message></Response>`);
+    return res.status(200).send(`<Response><Message>${escapeXml(finalReply + footer)}</Message></Response>`);
   } catch (e) {
     console.error("handler fatal", e);
     await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
