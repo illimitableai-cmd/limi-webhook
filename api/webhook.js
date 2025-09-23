@@ -54,8 +54,11 @@ function uidFromTwilio(from = "") {
 }
 
 async function dbg(step, payload, userId = null) {
-  try { await supabase.from("debug_logs").insert([{ step, payload, user_id: userId }]); }
-  catch (e) { console.error("dbg fail", e); }
+  try {
+    await supabase.from("debug_logs").insert([{ step, payload, user_id: userId }]);
+  } catch (e) {
+    console.error("dbg fail", e);
+  }
 }
 
 async function fetchTwilioMediaB64(url) {
@@ -69,21 +72,31 @@ async function fetchTwilioMediaB64(url) {
 // ---- memory helpers ----
 function blankMemory() {
   return {
-    name: null, location: null, email: null, birthday: null, timezone: null,
-    preferences: {}, interests: [], goals: [], notes: [], last_seen: new Date().toISOString(),
+    name: null,
+    location: null,
+    email: null,
+    birthday: null,
+    timezone: null,
+    preferences: {},
+    interests: [],
+    goals: [],
+    notes: [],
+    last_seen: new Date().toISOString(),
   };
 }
+
 function mergeMemory(oldMem, add) {
   const m = { ...blankMemory(), ...(oldMem || {}) };
   for (const k of ["name","location","email","birthday","timezone"]) if (add?.[k]) m[k] = add[k];
   m.preferences = { ...(oldMem?.preferences || {}), ...(add?.preferences || {}) };
   const dedupe = (a) => Array.from(new Set((a || []).filter(Boolean))).slice(0, 12);
   m.interests = dedupe([...(oldMem?.interests || []), ...(add?.interests || [])]);
-  m.goals     = dedupe([...(oldMem?.goals || []),     ...(add?.goals || [])]);
-  m.notes     = dedupe([...(oldMem?.notes || []),     ...(add?.notes || [])]);
+  m.goals = dedupe([...(oldMem?.goals || []), ...(add?.goals || [])]);
+  m.notes = dedupe([...(oldMem?.notes || []), ...(add?.notes || [])]);
   m.last_seen = new Date().toISOString();
   return m;
 }
+
 async function extractMemory(prior, newMsg) {
   const sys =
     "Return ONLY JSON of long-lived user facts to remember: " +
@@ -99,7 +112,9 @@ async function extractMemory(prior, newMsg) {
     const t = c.choices[0].message.content || "{}";
     const s = t.indexOf("{"), e = t.lastIndexOf("}");
     return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
-  } catch { return {}; }
+  } catch {
+    return {};
+  }
 }
 
 /** Compact memory snapshot for prompting */
@@ -109,10 +124,12 @@ function memorySnapshotForPrompt(mem) {
   if (mem.name) parts.push(`name: ${mem.name}`);
   if (mem.location) parts.push(`location: ${mem.location}`);
   if (mem.timezone) parts.push(`timezone: ${mem.timezone}`);
-  const prefs = mem.preferences && Object.keys(mem.preferences).length ? `preferences: ${JSON.stringify(mem.preferences)}` : null;
+
+  const prefs     = mem.preferences && Object.keys(mem.preferences).length ? `preferences: ${JSON.stringify(mem.preferences)}` : null;
   const interests = mem.interests && mem.interests.length ? `interests: ${mem.interests.slice(0,6).join(", ")}` : null;
-  const goals = mem.goals && mem.goals.length ? `goals: ${mem.goals.slice(0,4).join(", ")}` : null;
-  const notes = mem.notes && mem.notes.length ? `notes: ${mem.notes.slice(0,4).join("; ")}` : null;
+  const goals     = mem.goals && mem.goals.length ? `goals: ${mem.goals.slice(0,4).join(", ")}` : null;
+  const notes     = mem.notes && mem.notes.length ? `notes: ${mem.notes.slice(0,4).join("; ")}` : null;
+
   [prefs, interests, goals, notes].forEach(x => { if (x) parts.push(x); });
   return parts.length ? parts.join(" • ") : "None";
 }
@@ -137,17 +154,13 @@ function postProcessReply(reply, userMsg, prior) {
   const r = (reply || "").trim();
   const lower = r.toLowerCase();
   const tooShort = r.length < 8 || ["ok", "okay", "k", "sure", "noted"].includes(lower);
-
   // Keep admin-style answers short but not "OK"
   const adminy = /\b(emergency|contact|contacts|buy|help|settings?)\b/i.test(userMsg);
-
   if (!tooShort) return r;
-
   const name = prior?.name ? prior.name : null;
   if (adminy) {
     return name ? `All set, ${name}.` : "All set.";
   }
-
   const ack = name ? `Got it, ${name}.` : "Got it.";
   const ask = "Anything else you’d like me to sort out?";
   return `${ack} ${ask}`;
@@ -184,9 +197,12 @@ function prettyPhone(p = "") {
   const e = normalizePhone(p);
   if (!e.startsWith("+")) return e;
   let m;
-  m = e.match(/^\+44(\d{4})(\d{3})(\d{3})$/); if (m) return `+44 ${m[1]} ${m[2]} ${m[3]}`;
-  m = e.match(/^\+1(\d{3})(\d{3})(\d{4})$/);  if (m) return `+1 ${m[1]} ${m[2]} ${m[3]}`;
-  m = e.match(/^\+61(\d)(\d{4})(\d{4})$/);    if (m) return `+61 ${m[1]} ${m[2]} ${m[3]}`;
+  m = e.match(/^\+44(\d{4})(\d{3})(\d{3})$/);
+  if (m) return `+44 ${m[1]} ${m[2]} ${m[3]}`;
+  m = e.match(/^\+1(\d{3})(\d{3})(\d{4})$/);
+  if (m) return `+1 ${m[1]} ${m[2]} ${m[3]}`;
+  m = e.match(/^\+61(\d)(\d{4})(\d{4})$/);
+  if (m) return `+61 ${m[1]} ${m[2]} ${m[3]}`;
   const ccMatch = e.match(/^\+(\d{1,3})(\d+)$/);
   if (!ccMatch) return e;
   const cc = ccMatch[1], rest = ccMatch[2];
@@ -203,7 +219,7 @@ async function sendDirect({ channel, to, body }) {
   try {
     if (channel === "whatsapp") {
       const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
-      const waTo   = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+      const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
       const r = await twilioClient.messages.create({ from: waFrom, to: waTo, body });
       await dbg("direct_send_ok", { channel, sid: r.sid, to }, null);
       return true;
@@ -233,7 +249,10 @@ async function upsertContact({ userId, name, phone, channel }) {
       if (needsUpdate) {
         const { error: upErr } = await supabase.from("contacts")
           .update({ name: finalName, channel }).eq("id", byPhone.id);
-        if (upErr) { await dbg("contact_update_error", { code: upErr.code, message: upErr.message }, userId); return { ok: false, error: upErr }; }
+        if (upErr) {
+          await dbg("contact_update_error", { code: upErr.code, message: upErr.message }, userId);
+          return { ok: false, error: upErr };
+        }
       }
       await dbg("contact_upsert_ok", { action: "update_by_phone", name: finalName, phone: normPhone, channel }, userId);
       return { ok: true, action: "update_by_phone" };
@@ -242,20 +261,27 @@ async function upsertContact({ userId, name, phone, channel }) {
     const { data: byName } = await supabase
       .from("contacts").select("id,name,phone,channel")
       .eq("user_id", userId).ilike("name", tidyIncoming);
+
     const existingByName = (byName || []).find(
       (r) => (r.name || "").trim().toLowerCase() === tidyIncoming.toLowerCase()
     );
     if (existingByName) {
       const { error: upErr2 } = await supabase.from("contacts")
         .update({ phone: normPhone, channel }).eq("id", existingByName.id);
-      if (upErr2) { await dbg("contact_update_conflict", { code: upErr2.code, message: upErr2.message }, userId); return { ok: false, error: upErr2 }; }
+      if (upErr2) {
+        await dbg("contact_update_conflict", { code: upErr2.code, message: upErr2.message }, userId);
+        return { ok: false, error: upErr2 };
+      }
       await dbg("contact_upsert_ok", { action: "update_by_name", name: existingByName.name, phone: normPhone, channel }, userId);
       return { ok: true, action: "update_by_name" };
     }
 
     const { error: insErr } = await supabase.from("contacts")
       .insert({ user_id: userId, name: tidyIncoming, phone: normPhone, channel });
-    if (insErr) { await dbg("contact_insert_error", { code: insErr.code, message: insErr.message }, userId); return { ok: false, error: insErr }; }
+    if (insErr) {
+      await dbg("contact_insert_error", { code: insErr.code, message: insErr.message }, userId);
+      return { ok: false, error: insErr };
+    }
 
     await dbg("contact_upsert_ok", { action: "insert_new", name: tidyIncoming, phone: normPhone, channel }, userId);
     return { ok: true, action: "insert_new" };
@@ -289,17 +315,21 @@ async function getOrCreateUserId(identifier) {
     if (ident3?.user_id) return ident3.user_id;
     throw linkErr;
   }
+
   return user.id;
 }
+
 async function loadRecentTurns(userId, limit = 12) {
   const { data } = await supabase
     .from("messages").select("role, body").eq("user_id", userId)
     .order("created_at", { ascending: false }).limit(limit);
   return (data || []).reverse().map((r) => ({ role: r.role, content: r.body }));
 }
+
 async function saveTurn(userId, role, text, channel, externalId) {
   await supabase.from("messages").insert([{ user_id: userId, role, body: text, channel, external_id: externalId }]);
 }
+
 async function getCredits(userId) {
   const { data } = await supabase.from("credits").select("balance").eq("user_id", userId).maybeSingle();
   return data?.balance ?? 0;
@@ -315,25 +345,20 @@ async function ensureCredits(userId) {
     .select("balance")
     .eq("user_id", userId)
     .maybeSingle();
-
   if (error) {
     await dbg("credits_select_error", { code: error.code, message: error.message }, userId);
   }
-
   if (!data) {
     const { error: insErr } = await supabase
       .from("credits")
       .insert([{ user_id: userId, balance: FREE_TRIAL_CREDITS }]);
-
     if (insErr) {
       await dbg("credits_insert_error", { code: insErr.code, message: insErr.message }, userId);
       return 0;
     }
-
     await dbg("credits_seeded", { seeded: FREE_TRIAL_CREDITS }, userId);
     return FREE_TRIAL_CREDITS;
   }
-
   return data.balance ?? 0;
 }
 
@@ -342,6 +367,7 @@ function parseSaveContact(msg) {
   const text = (msg || "").trim();
   const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
   let phone = phoneMatch ? phoneMatch[1] : null;
+
   const patterns = [
     /(?:save|add)?\s*([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*['’]\s*s\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
@@ -353,18 +379,21 @@ function parseSaveContact(msg) {
     /add\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})[\s,]+(\+?\d[\d\s().-]{6,})/i,
   ];
+
   let name = null;
   for (const re of patterns) {
     const m = re.exec(text);
     if (!m) continue;
     if (m[2]) phone = m[2];
-    if (m[1]) name  = m[1];
+    if (m[1]) name = m[1];
     break;
   }
   if (!name || !phone) return null;
+
   const tidyName = sanitizeName(name);
   const normPhone = normalizePhone(phone);
   if (isBadName(tidyName)) return null;
+
   return { name: tidyName, phone: normPhone };
 }
 
@@ -447,7 +476,6 @@ function extractNameQuick(text = "") {
 }
 
 /* ===================== EMERGENCY CONTACTS ===================== */
-
 /** Natural-language emergency intent extractor (free, tiny response) */
 async function emgExtractNatural(text = "") {
   const sys =
@@ -476,8 +504,10 @@ async function listEmergencyContacts(userId) {
     .select("name, phone, channel")
     .eq("user_id", userId)
     .order("name", { ascending: true });
-  if (error) { await dbg("emg_list_error", { code: error.code, msg: error.message }, userId); }
-  return data || [];
+  if (error) {
+    await dbg("emg_list_error", { code: error.code, msg: error.message }, userId);
+  }
+  return (data || []);
 }
 
 /** Upsert by PHONE first (prevents duplicates), else insert */
@@ -497,14 +527,20 @@ async function upsertEmergencyContact({ userId, name, phone, channel = "both" })
       .from("emergency_contacts")
       .update({ name: tidyName, channel })
       .eq("id", byPhone.id);
-    if (error) { await dbg("emg_update_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
+    if (error) {
+      await dbg("emg_update_error", { code: error.code, msg: error.message }, userId);
+      return { ok:false };
+    }
     return { ok:true, action:"update_phone" };
   }
 
   const { error } = await supabase
     .from("emergency_contacts")
     .insert({ user_id: userId, name: tidyName, phone: normPhone, channel });
-  if (error) { await dbg("emg_insert_error", { code: error.code, msg: error.message }, userId); return { ok:false }; }
+  if (error) {
+    await dbg("emg_insert_error", { code: error.code, msg: error.message }, userId);
+    return { ok:false };
+  }
   return { ok:true, action:"insert" };
 }
 
@@ -515,7 +551,10 @@ async function removeEmergencyContact(userId, name) {
     .delete()
     .eq("user_id", userId)
     .ilike("name", tidy);
-  if (error) { await dbg("emg_remove_error", { code: error.code, msg: error.message }, userId); return false; }
+  if (error) {
+    await dbg("emg_remove_error", { code: error.code, msg: error.message }, userId);
+    return false;
+  }
   return true;
 }
 
@@ -545,13 +584,12 @@ async function sendEmergencyAlert({ userId, from }) {
   for (const c of contacts) {
     const to = normalizePhone(c.phone);
     const via = (c.channel || "both").toLowerCase();
-
     if (via === "sms" || via === "both") {
       tasks.push(twilioClient.messages.create({ from: TWILIO_FROM, to, body: msg }));
     }
     if (via === "whatsapp" || via === "both") {
       const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
-      const waTo   = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+      const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
       tasks.push(twilioClient.messages.create({ from: waFrom, to: waTo, body: msg }));
     }
   }
@@ -570,7 +608,6 @@ async function sendEmergencyAlert({ userId, from }) {
 /* UPDATED: accept both orders (name→phone) and (phone→name) */
 function parseAddEmergency(text = "") {
   const t = text.trim();
-
   // Pattern A: name THEN phone
   const reA = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
   // Pattern B: phone THEN name
@@ -594,26 +631,38 @@ function parseAddEmergency(text = "") {
   }
   return null;
 }
+
 function parseRemoveEmergency(text="") {
   const re = /(?:remove|delete)\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})$/i;
   const m = text.trim().match(re);
   return m ? sanitizeName(m[1]) : null;
 }
-function isEmergencyList(text="") {
-  return /^\s*emergency\s+contacts\s*$/i.test(text);
+
+/* -------- broadened emergency-contact list intent matcher (like normal contacts) -------- */
+function isEmergencyContactListQuery(text = "") {
+  const t = (text || "").trim();
+
+  // Exact short forms
+  if (/^\s*(emergency\s+contacts|ice\s+contacts)\s*$/i.test(t)) return true;
+
+  // Common phrasings
+  if (/(^|\b)(show|list|see|view|display)\s+(my\s+)?(emergency|ice)\s+contacts(\b|$)/i.test(t)) return true;
+  if (/(^|\b)can\s+i\s+have\s+(my\s+)?(emergency|ice)\s+contacts(\b|$)/i.test(t)) return true;
+
+  // Questions
+  if (/\bwho\s+is\s+in\s+my\s+(emergency|ice)\s+contacts\??$/i.test(t)) return true;
+  if (/\bwhat('?| i)?s?\s+my\s+(emergency|ice)\s+contact\s+list\??$/i.test(t)) return true;
+  if (/\bwhat\s+is\s+my\s+(emergency|ice)\s+contact\s+list\??$/i.test(t)) return true;
+
+  // “In case of emergency” phrasing
+  if (/(^|\b)(in\s+case\s+of\s+)?emergency\s+contact(s)?\s+list(\b|$)/i.test(t)) return true;
+
+  return false;
 }
 
-/* NEW: broader emergency contacts list matcher */
-function isEmergencyListQuery(text = "") {
-  const t = (text || "").trim().toLowerCase();
-  return (
-    /^emergency\s+contacts?$/.test(t) ||
-    /^show\s+emergency\s+contacts?$/.test(t) ||
-    /^list\s+emergency\s+contacts?$/.test(t) ||
-    /\bwho\s+are\s+my\s+emergency\s+contacts\??$/.test(t) ||
-    /\bwhat('?| i)?s?\s+my\s+emergency\s+contacts?\b/.test(t) ||
-    /\bemergency\s+contact\s+list\b/.test(t)
-  );
+// Back-compat shim so any old calls still work:
+function isEmergencyList(text = "") {
+  return isEmergencyContactListQuery(text);
 }
 
 function isHelpTrigger(text="") {
@@ -621,6 +670,7 @@ function isHelpTrigger(text="") {
 }
 
 // ===================================================================
+
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") {
@@ -629,7 +679,8 @@ export default async function handler(req, res) {
     }
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    const chunks = []; for await (const c of req) chunks.push(c);
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
     const p = new URLSearchParams(raw);
 
@@ -676,5 +727,262 @@ export default async function handler(req, res) {
         const merged0 = mergeMemory(prior0, { name: quickName });
         await supabase.from("memories").upsert({ user_id: userId, summary: merged0 });
         await upsertContact({ userId, name: quickName, phone: from, channel });
+        const ack = `Nice to meet you, ${quickName}. I’ll remember that.`;
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", ack, channel, from);
+        res.setHeader("Content-Type", "text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(ack)}</Message></Response>`);
+      }
+    }
 
-        const ack = `Nice to meet you, ${
+    // --- "WHAT IS MY NAME?" quick answer ---
+    if (/^\s*what('?| i)?s?\s+my\s+name\??\s*$/i.test(body) || /^\s*what\s+is\s+my\s+name\??\s*$/i.test(body)) {
+      const { data: memRow1 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
+      const name = memRow1?.summary?.name;
+      const msg = name ? `Your name is ${name}.` : "I don’t have your name yet. What’s your first name so I can save it?";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    /* ==================== EMERGENCY: natural-language router (free) ==================== */
+    const emgNLU = await emgExtractNatural(body);
+    await dbg("emg_nlu", emgNLU, userId); // log what NLU extracted
+
+    if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
+      if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
+        const channelPref = (emgNLU.channel || "both").toLowerCase();
+        const r = await upsertEmergencyContact({
+          userId,
+          name: emgNLU.name,
+          phone: emgNLU.phone,
+          channel: ["sms","whatsapp","both"].includes(channelPref) ? channelPref : "both",
+        });
+        const msg = r.ok
+          ? (r.action === "insert" || r.action === "update_phone"
+              ? `Added emergency contact: ${sanitizeName(emgNLU.name)}.`
+              : `Updated emergency contact: ${sanitizeName(emgNLU.name)}.`)
+          : "Sorry, I couldn't save that emergency contact.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        await sendDirect({ channel, to: from, body: msg });
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send("<Response/>");
+      }
+
+      if (emgNLU.intent === "remove" && emgNLU.name) {
+        const ok = await removeEmergencyContact(userId, emgNLU.name);
+        const msg = ok
+          ? `Removed emergency contact: ${sanitizeName(emgNLU.name)}.`
+          : "Sorry, I couldn't remove that emergency contact.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        await sendDirect({ channel, to: from, body: msg });
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send("<Response/>");
+      }
+
+      if (emgNLU.intent === "list") {
+        const list = await listEmergencyContacts(userId);
+        const msg = list.length
+          ? "🚨 Emergency Contacts:\n" + list.map(c => `- ${sanitizeName(c.name)}: ${normalizePhone(c.phone)} (${c.channel||'both'})`).join("\n")
+          : "You have no emergency contacts yet. You can say things like “add my mum to my emergency contacts, 07123 456789”.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        await sendDirect({ channel, to: from, body: msg });
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send("<Response/>");
+      }
+    }
+
+    // --- Emergency power-user regex (still supported)
+    const addEmg = parseAddEmergency(body);
+    if (addEmg) {
+      await dbg("emg_upsert_req", addEmg, userId);
+      const r = await upsertEmergencyContact({ userId, ...addEmg });
+      const msg = r.ok
+        ? (r.action === "insert"
+            ? `Added emergency contact: ${addEmg.name}.`
+            : `Updated emergency contact: ${addEmg.name}.`)
+        : "Sorry, I couldn't save that emergency contact.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response/>");
+    }
+
+    const remEmg = parseRemoveEmergency(body);
+    if (remEmg) {
+      const ok = await removeEmergencyContact(userId, remEmg);
+      const msg = ok
+        ? `Removed emergency contact: ${remEmg}.`
+        : "Sorry, I couldn't remove that emergency contact.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response/>");
+    }
+
+    // ==== NEW: broadened EMERGENCY LIST quick path (no model, no credits)
+    if (isEmergencyContactListQuery(body)) {
+      const list = await listEmergencyContacts(userId);
+
+      let msg = "You have no emergency contacts yet.";
+      if (list.length) {
+        const rows = list.map(c => {
+          const name = sanitizeName(c.name || "");
+          const phone = normalizePhone(c.phone || "");
+          const chan  = (c.channel || "both");
+          return `- ${name}: ${phone} (${chan})`;
+        });
+        msg = "🚨 Emergency Contacts:\n" + rows.join("\n");
+      } else {
+        msg += " Add one like: add emergency contact Alex +447700900000 sms";
+      }
+
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    // HELP trigger (send alert)
+    if (isHelpTrigger(body)) {
+      const result = await sendEmergencyAlert({ userId, from });
+      let msg = "";
+      if (result.ok) msg = `Alert sent to ${result.count} emergency contact(s).`;
+      else if (result.reason === "cooldown") msg = "Emergency alert was just sent. Please wait a moment before sending another.";
+      else if (result.reason === "no_contacts") msg = "You have no emergency contacts yet. Add one first: add emergency contact Alex +447700900000";
+      else msg = "Sorry, I couldn't send the alert right now.";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      await sendDirect({ channel, to: from, body: msg });
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response/>");
+    }
+
+    // ---- CONTACT LIST quick path (no model, no credits)
+    if (isContactListQuery(body)) {
+      const { data: contacts, error: listErr } = await supabase
+        .from("contacts")
+        .select("name, phone")
+        .eq("user_id", userId)
+        .order("name", { ascending: true })
+        .limit(200);
+
+      let msg = "No contacts saved yet.";
+      if (!listErr && Array.isArray(contacts) && contacts.length) {
+        const rows = contacts.map(c => {
+          const name = sanitizeName(c.name || "");
+          const phone = normalizePhone(c.phone || "");
+          return `- ${name}: ${phone}`;
+        });
+        msg = "📇 Your Contacts:\n" + rows.join("\n");
+      } else if (listErr) {
+        await dbg("contacts_list_error", { code: listErr.code, message: listErr.message }, userId);
+        msg = "Sorry, couldn't fetch contacts right now.";
+      }
+
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+    }
+
+    // ---- FAST contact save (regex + LLM fallback)
+    let contact = parseSaveContact(body);
+    if (!contact) {
+      try {
+        contact = await llmExtractContact(body);
+        if (contact) await dbg("contact_llm_extracted", contact, userId);
+      } catch (e) {
+        await dbg("contact_llm_extract_error", { message: String(e) }, userId);
+      }
+    }
+    if (contact) {
+      const result = await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
+      const verb = result?.action === "insert_new" ? "Saved" : "Updated";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", `${verb} ${contact.name}`, channel, from);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
+    }
+
+    // === CREDITS GATE (auto-seed if missing)
+    const credits = await ensureCredits(userId);
+    if (credits <= 0) {
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
+    }
+
+    // ---- memory + media
+    const { data: memRow } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
+    const prior = memRow?.summary ?? blankMemory();
+
+    await dbg("wa_media_meta", {
+      channel,
+      numMedia,
+      mediaUrl0: p.get("MediaUrl0"),
+      mediaType0: p.get("MediaContentType0")
+    }, userId);
+
+    let userMsg = body || "";
+    let visionPart = null;
+    if (channel === "whatsapp" && numMedia > 0) {
+      try {
+        const mediaUrl = p.get("MediaUrl0");
+        const ctype = p.get("MediaContentType0") || "image/jpeg";
+        const b64 = await fetchTwilioMediaB64(mediaUrl);
+        visionPart = { type: "image_url", image_url: { url: `data:${ctype};base64,${b64}` } };
+        if (!userMsg) userMsg = "Please analyse this image.";
+      } catch (err) {
+        await dbg("wa_media_fetch_error", { message: String(err) }, userId);
+      }
+    }
+
+    await saveTurn(userId, "user", userMsg, channel, from);
+
+    const history = cleanHistory(await loadRecentTurns(userId, 12));
+    const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
+    const messages = [
+      { role: "system", content: buildSystemPrompt(prior) }, // richer persona + memory snapshot
+      ...history.slice(-11),
+      { role: "user", content: userContent },
+    ];
+
+    const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 180 });
+
+    let reply = completion.choices[0].message.content?.trim() || "OK";
+    reply = postProcessReply(reply, userMsg, prior); // avoid dull “OK”, add tiny follow-up if needed
+
+    await dbg("reply_out", { channel, to: from, reply }, userId);
+
+    await saveTurn(userId, "assistant", reply, channel, from);
+    await setCredits(userId, Math.max(0, credits - 1));
+
+    const extracted = await extractMemory(prior, body);
+    const merged = mergeMemory(prior, extracted);
+    await supabase.from("memories").upsert({ user_id: userId, summary: merged });
+
+    const bestName = merged?.name || (waProfile ? sanitizeName(waProfile) : null) || null;
+    if (bestName) {
+      await upsertContact({ userId, name: bestName, phone: from, channel });
+    }
+
+    let footer = "";
+    if (!merged?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
+
+    res.setHeader("Content-Type","text/xml");
+    return res.status(200).send(`<Response><Message>${escapeXml(reply + footer)}</Message></Response>`);
+  } catch (e) {
+    console.error("handler fatal", e);
+    await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
+    res.setHeader("Content-Type","text/xml");
+    return res.status(200).send("<Response><Message>Sorry, something went wrong.</Message></Response>");
+  }
+}
