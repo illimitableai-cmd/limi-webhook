@@ -23,6 +23,18 @@ const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 // ===== NEW: enforce a minimum-length reply =====
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 
+// ===== NEW: optional safety net to REST-send SMS even if TwiML path hiccups
+const FORCE_DIRECT = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
+
+// ====== Watchdog timeout helper ======
+function withTimeout(promise, ms, onTimeoutMsg = "Sorry—took too long to respond.") {
+  let t;
+  const timeout = new Promise((resolve) => {
+    t = setTimeout(() => resolve({ __timeout: true, content: onTimeoutMsg }), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
 // Helper: expand too-short answers using the same chat model
 async function expandIfShort({ reply, userMsg, minChars = MIN_REPLY_CHARS }) {
   const base = (reply || "").trim();
@@ -220,6 +232,7 @@ function buildSystemPrompt(prior) {
     "Ask at most ONE short, natural follow-up if it clearly helps the user make progress.",
     "If the user states info (not a question), acknowledge briefly and offer a practical next step.",
     "Avoid generic non-answers like 'OK' or 'Sure'.",
+    "Always answer 'how many' questions with a concrete number or best estimate and a brief qualifier if uncertain.",
     "Where numbers/lists help clarity, use simple bullets or 1) 2) 3). Keep SMS-friendly line lengths.",
     `User profile snapshot: ${snapshot}`
   ].join("\n");
@@ -741,6 +754,8 @@ export default async function handler(req, res) {
     }
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
+    res.setHeader("Cache-Control", "no-store");
+
     // Read raw body
     const chunks = [];
     for await (const c of req) chunks.push(c);
@@ -783,7 +798,11 @@ export default async function handler(req, res) {
     const numMedia = Number(NumMedia || 0);
     const waProfile = ProfileName || null;
 
-    await dbg("webhook_in", { channel, from, body, numMedia });
+    const isTwilioWebhook =
+      !!req.headers["x-twilio-signature"] ||
+      p.has("MessageSid") || p.has("SmsMessageSid") || p.has("AccountSid");
+
+    await dbg("webhook_in", { channel, from, body, numMedia, isTwilioWebhook });
 
     // Guard: missing sender
     if (!from) {
@@ -1053,9 +1072,20 @@ export default async function handler(req, res) {
       { role: "user", content: userContent },
     ];
 
-    // ===== Main answer (now on GPT-5 Nano by default) =====
-    const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 });
-    let reply = completion.choices[0].message.content?.trim() || "";
+    // ===== Main answer (GPT-5 Nano) with a 12s watchdog =====
+    const completion = await withTimeout(
+      safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }),
+      12000,
+      "Sorry—took too long to respond."
+    );
+
+    let reply = "";
+    if (completion?.__timeout) {
+      await dbg("model_timeout", { ms: 12000 }, userId);
+      reply = completion.content;
+    } else {
+      reply = completion.choices?.[0]?.message?.content?.trim() || "Sorry—couldn’t get that.";
+    }
 
     // Enforce minimum length BEFORE post-processing
     reply = await expandIfShort({ reply, userMsg });
@@ -1080,12 +1110,12 @@ export default async function handler(req, res) {
       if (finalReply.length > 1200) finalReply = finalReply.slice(0, 1190) + "…";
     }
 
-    await dbg("reply_out", { channel, to: from, reply: finalReply }, userId);
+    await dbg("reply_out", { channel, to: from, reply: finalReply, FORCE_DIRECT }, userId);
 
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
 
-    // ===== Update rolling conversation summary
+    // ===== Update rolling conversation summary (best effort)
     try {
       const slimHistory = history.slice(-10);
       const newSummary = await summariseConversation({
@@ -1099,7 +1129,7 @@ export default async function handler(req, res) {
       await dbg("convo_summary_error", { message: String(e) }, userId);
     }
 
-    // ===== Extract long-lived profile memory
+    // ===== Extract long-lived profile memory (best effort)
     try {
       const extracted = await extractMemory(prior, body);
       if (extracted && Object.keys(extracted).length) {
@@ -1118,8 +1148,18 @@ export default async function handler(req, res) {
     const latestMem = (await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle()).data?.summary;
     if (!latestMem?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
 
+    // ===== Delivery decision =====
+    // Safety net: force a REST send for SMS if enabled (prevents “no reply” even if TwiML path fails)
+    if (FORCE_DIRECT && channel === "sms") {
+      const ok = await sendDirect({ channel, to: from, body: finalReply + footer });
+      await dbg("direct_send_forced", { ok, to: from }, userId);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response/>"); // empty TwiML to avoid double-send
+    }
+
+    // Normal path: return TwiML with the message
     res.setHeader("Content-Type","text/xml");
-    return res.status(200).send(`<Response><Message>${escapeXml(finalReply + footer)}</Message></Response>`);
+    return res.status(200).send(`<Response><Message>${escapeXml((finalReply || "Sorry—something went wrong.") + footer)}</Message></Response>`);
   } catch (e) {
     console.error("handler fatal", e);
     await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
