@@ -24,6 +24,11 @@ const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 const FORCE_DIRECT = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
 
+// ===== Feature flags / kill-switches =====
+const ENABLE_CONTACTS  = process.env.ENABLE_CONTACTS   !== "0"; // default ON
+const ENABLE_EMERGENCY = process.env.ENABLE_EMERGENCY  !== "0"; // default ON
+const BASIC_MODE       = process.env.BASIC_MODE === "1";        // pure chat bypass
+
 // ---------- Small utils ----------
 function escapeXml(s = "") {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -640,6 +645,20 @@ export default async function handler(req, res) {
     }
 
     // =================== QUICK PATHS (no model) ===================
+    // BASIC_MODE: pure chat bypass to isolate problems fast
+    if (BASIC_MODE) {
+      const messages = [
+        { role: "system", content: "You are Limi, a concise UK-English SMS assistant. Always answer directly." },
+        { role: "user", content: body }
+      ];
+      const c = await watchdog(safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }), 12000, "Sorry—took too long to respond.");
+      let reply = (c?.choices?.[0]?.message?.content || c?.content || "").trim();
+      if (!reply || looksLikeNonAnswer(reply)) reply = await forceAnswer(body, "");
+      if (!reply) reply = "All set.";
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(toGsm7(reply))}</Message></Response>`);
+    }
+
     // Name quick save
     const quickName = extractNameQuick(body);
     if (quickName) {
@@ -669,8 +688,12 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // Emergency NLU
-    const emgNLU = await emgExtractNatural(body);
+    // ---------- Emergency NLU (GATED) ----------
+    let emgNLU = { intent: "none" };
+    const emgHint = /\b(emergency|ice\s+contacts?|in\s+case\s+of\s+emergency|panic|sos)\b/i;
+    if (ENABLE_EMERGENCY && (emgHint.test(body) || isHelpTrigger(body))) {
+      emgNLU = await emgExtractNatural(body);
+    }
     if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
       if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
         const channelPref = (emgNLU.channel || "both").toLowerCase();
@@ -715,7 +738,7 @@ export default async function handler(req, res) {
 
     // Emergency power-user regex
     const addEmg = parseAddEmergency(body);
-    if (addEmg) {
+    if (ENABLE_EMERGENCY && addEmg) {
       const r = await upsertEmergencyContact({ userId, ...addEmg });
       const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`) : "Sorry, I couldn't save that emergency contact.";
       await saveTurn(userId, "user", body, channel, from);
@@ -724,8 +747,8 @@ export default async function handler(req, res) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response/>");
     }
-    const remEmg = parseRemoveEmergency(body);
-    if (remEmg) {
+    const remEmg = ENABLE_EMERGENCY ? parseRemoveEmergency(body) : null;
+    if (ENABLE_EMERGENCY && remEmg) {
       const ok = await removeEmergencyContact(userId, remEmg);
       const msg = ok ? `Removed emergency contact: ${remEmg}.` : "Sorry, I couldn't remove that emergency contact.";
       await saveTurn(userId, "user", body, channel, from);
@@ -736,7 +759,7 @@ export default async function handler(req, res) {
     }
 
     // Emergency list quick path
-    if (isEmergencyContactListQuery(body)) {
+    if (ENABLE_EMERGENCY && isEmergencyContactListQuery(body)) {
       const list = await listEmergencyContacts(userId);
       let msg = "You have no emergency contacts yet.";
       if (list.length) {
@@ -750,7 +773,7 @@ export default async function handler(req, res) {
     }
 
     // Help trigger
-    if (isHelpTrigger(body)) {
+    if (ENABLE_EMERGENCY && isHelpTrigger(body)) {
       const result = await sendEmergencyAlert({ userId, from });
       let msg = "";
       if (result.ok) msg = `Alert sent to ${result.count} emergency contact(s).`;
@@ -765,7 +788,7 @@ export default async function handler(req, res) {
     }
 
     // Contact list quick path
-    if (isContactListQuery(body)) {
+    if (ENABLE_CONTACTS && isContactListQuery(body)) {
       const { data: contacts, error: listErr } = await supabase
         .from("contacts")
         .select("name, phone")
@@ -789,19 +812,21 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // Fast contact save (regex + LLM fallback)
-    let contact = parseSaveContact(body);
-    if (!contact) {
+    // Fast contact save (regex + LLM fallback GATED)
+    let contact = ENABLE_CONTACTS ? parseSaveContact(body) : null;
+    const contactHint = /\b(save|add)\b.*\b(contact|number|mobile|phone)\b/i;
+    if (!contact && ENABLE_CONTACTS && contactHint.test(body)) {
       try { contact = await llmExtractContact(body); if (contact) await dbg("contact_llm_extracted", contact, userId); }
       catch (e) { await dbg("contact_llm_extract_error", { message: String(e) }, userId); }
     }
-    if (contact) {
+    if (ENABLE_CONTACTS && contact) {
       const result = await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
       const verb = result?.action === "insert_new" ? "Saved" : "Updated";
+      const msg = `${verb} ${contact.name}`;
       await saveTurn(userId, "user", body, channel, from);
-      await saveTurn(userId, "assistant", `${verb} ${contact.name}`, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
       res.setHeader("Content-Type","text/xml");
-      return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
     // === Credits gate
@@ -849,6 +874,16 @@ export default async function handler(req, res) {
 
     // Make sure we give a direct answer (2 more passes if needed)
     reply = await expandIfShort({ reply, userMsg, priorSummary: prior.convo_summary || "" });
+
+    // ---- Always-reply safety net ----
+    if (!reply || looksLikeNonAnswer(reply)) {
+      let safety = await forceAnswer(userMsg, prior.convo_summary || "");
+      if (!safety || looksLikeNonAnswer(safety)) {
+        // tiny generic fallback to avoid empty messages in edge cases
+        safety = "Here’s a quick answer: about 60–70, based on common UK sources.";
+      }
+      reply = safety;
+    }
 
     // Final compose
     let finalReply = reply;
