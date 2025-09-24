@@ -741,23 +741,62 @@ export default async function handler(req, res) {
     }
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
+    // Read raw body
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
-    const p = new URLSearchParams(raw);
 
-    const rawFrom  = p.get("From") || "";
+    // Parse Twilio form params first
+    const p = new URLSearchParams(raw);
+    let Body               = p.get("Body");
+    let From               = p.get("From");
+    let NumMedia           = p.get("NumMedia");
+    let ProfileName        = p.get("ProfileName");
+    let MediaUrl0          = p.get("MediaUrl0");
+    let MediaContentType0  = p.get("MediaContentType0");
+    let ChannelOverride    = null;
+
+    // DEV-FRIENDLY JSON FALLBACK (accepts { body, from, channel, numMedia, profileName, mediaUrl0, mediaType0 })
+    if ((!Body && !From) && raw && raw.trim().startsWith("{")) {
+      try {
+        const j = JSON.parse(raw);
+        Body              = Body              ?? j.Body       ?? j.body       ?? "";
+        From              = From              ?? j.From       ?? j.from       ?? "";
+        NumMedia          = NumMedia          ?? j.NumMedia   ?? j.numMedia   ?? 0;
+        ProfileName       = ProfileName       ?? j.ProfileName?? j.profileName?? null;
+        MediaUrl0         = MediaUrl0         ?? j.MediaUrl0  ?? j.mediaUrl0  ?? null;
+        MediaContentType0 = MediaContentType0 ?? j.MediaContentType0 ?? j.mediaType0 ?? null;
+        ChannelOverride   = typeof j.channel === "string" ? j.channel : null;
+      } catch (e) {
+        await dbg("json_parse_error", { snippet: raw.slice(0,200) });
+      }
+    }
+
+    // Work out channel and normalised sender
+    let rawFrom = From || "";
+    if (ChannelOverride && /^whatsapp$/i.test(ChannelOverride) && rawFrom && !/^whatsapp:/i.test(rawFrom)) {
+      rawFrom = `whatsapp:${rawFrom}`;
+    }
     const channel  = rawFrom.startsWith("whatsapp:") ? "whatsapp" : "sms";
     const from     = uidFromTwilio(rawFrom);
-    const body     = (p.get("Body") || "").trim();
-    const numMedia = Number(p.get("NumMedia") || 0);
-    const waProfile = p.get("ProfileName") || null;
+    const body     = (Body || "").trim();
+    const numMedia = Number(NumMedia || 0);
+    const waProfile = ProfileName || null;
 
     await dbg("webhook_in", { channel, from, body, numMedia });
 
+    // Guard: missing sender
     if (!from) {
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send("<Response><Message>Missing sender</Message></Response>");
+    }
+
+    // Guard: empty body
+    if (!body && numMedia === 0) {
+      const msg = "I received an empty message. Please send your question as text.";
+      await dbg("empty_body_guard", { rawSnippet: raw.slice(0, 200) }, null);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
     if (channel === "sms" && numMedia > 0) {
@@ -986,17 +1025,16 @@ export default async function handler(req, res) {
     await dbg("wa_media_meta", {
       channel,
       numMedia,
-      mediaUrl0: p.get("MediaUrl0"),
-      mediaType0: p.get("MediaContentType0")
+      mediaUrl0: MediaUrl0,
+      mediaType0: MediaContentType0
     }, userId);
 
     let userMsg = body || "";
     let visionPart = null;
-    if (channel === "whatsapp" && numMedia > 0) {
+    if (channel === "whatsapp" && numMedia > 0 && MediaUrl0) {
       try {
-        const mediaUrl = p.get("MediaUrl0");
-        const ctype = p.get("MediaContentType0") || "image/jpeg";
-        const b64 = await fetchTwilioMediaB64(mediaUrl);
+        const b64 = await fetchTwilioMediaB64(MediaUrl0);
+        const ctype = MediaContentType0 || "image/jpeg";
         visionPart = { type: "image_url", image_url: { url: `data:${ctype};base64,${b64}` } };
         if (!userMsg) userMsg = "Please analyse this image.";
       } catch (err) {
