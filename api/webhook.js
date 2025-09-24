@@ -11,15 +11,45 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 const TWILIO_FROM = process.env.TWILIO_FROM;
 
-const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5";
+// ===== Models: default to GPT-5 Nano (supports text+image input, text output)
+const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-nano";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
+// Optional: allow pinning a snapshot via env
+const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-nano-2025-08-07";
 
 // FREE TRIAL amount used when we first see a user with no credits row
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 
-// ===== Core model wrapper (kept) =====
+// ===== NEW: enforce a minimum-length reply =====
+const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
+
+// Helper: expand too-short answers using the same chat model
+async function expandIfShort({ reply, userMsg, minChars = MIN_REPLY_CHARS }) {
+  const base = (reply || "").trim();
+  if (base.length >= minChars) return base;
+
+  const sys =
+    "Rewrite the assistant reply so it DIRECTLY answers the user's question in 1–3 concise UK-English sentences. " +
+    "Avoid fluff. Include a concrete figure if the user asked 'how many'. Keep it SMS-friendly.";
+  const usr = `User: ${userMsg}\n\nDraft reply to improve:\n${base}\n\nRewrite now (>= ${minChars} characters):`;
+  try {
+    const c = await safeChatCompletion({
+      model: CHAT_MODEL,
+      messages: [{ role: "system", content: sys }, { role: "user", content: usr }],
+      maxTokens: 220,
+    });
+    const improved = (c.choices?.[0]?.message?.content || "").trim();
+    if (improved.length >= minChars) return improved;
+    return improved || base || "Here’s a quick answer: I couldn’t parse that—try rephrasing?";
+  } catch {
+    return base || "Here’s a quick answer: I couldn’t parse that—try rephrasing?";
+  }
+}
+
+// ===== Core model wrapper (GPT-5 uses max_completion_tokens) =====
+const GPT5_RE = /^gpt-5/i;
 async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.4, maxTokens = 180 }) {
-  const isGpt5 = /^gpt-5/i.test(model);
+  const isGpt5 = GPT5_RE.test(model);
   const args = { model, messages };
   if (isGpt5) {
     args.max_completion_tokens = maxTokens;
@@ -27,10 +57,39 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
     args.max_tokens = maxTokens;
     args.temperature = temperature;
   }
+
   try {
     return await openai.chat.completions.create(args);
   } catch (err) {
     await dbg("model_fallback", { tried: model, error: String(err) });
+
+    // 1) Try pinned snapshot (if different)
+    if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
+      try {
+        const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
+        if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) {
+          delete a2.max_tokens; delete a2.temperature;
+          a2.max_completion_tokens = maxTokens;
+        }
+        return await openai.chat.completions.create(a2);
+      } catch (e2) {
+        await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) });
+      }
+    }
+
+    // 2) Try plain gpt-5-nano
+    if (model !== "gpt-5-nano") {
+      try {
+        const a3 = { ...args, model: "gpt-5-nano" };
+        delete a3.max_tokens; delete a3.temperature;
+        a3.max_completion_tokens = maxTokens;
+        return await openai.chat.completions.create(a3);
+      } catch (e3) {
+        await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) });
+      }
+    }
+
+    // 3) Last resort: 4o-mini (keeps service alive)
     return await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
@@ -81,7 +140,6 @@ function blankMemory() {
     interests: [],
     goals: [],
     notes: [],
-    // NEW: rolling conversation summary (string)
     convo_summary: "",
     last_seen: new Date().toISOString(),
   };
@@ -96,7 +154,6 @@ function mergeMemory(oldMem, add) {
   const dedupe = (a) => Array.from(new Set((a || []).filter(Boolean))).slice(0, 12);
   m.interests = dedupe([...(oldMem?.interests || []), ...(add?.interests || [])]);
   m.goals = dedupe([...(oldMem?.goals || []), ...(add?.goals || [])]);
-  // Keep up to 20 short notes max
   m.notes = dedupe([...(oldMem?.notes || []), ...(add?.notes || [])]).slice(0, 20);
   m.last_seen = new Date().toISOString();
   return m;
@@ -123,9 +180,8 @@ async function extractMemory(prior, newMsg) {
   }
 }
 
-/** NEW: Summarise conversation so far into a compact rolling summary */
+/** Rolling conversation summary */
 async function summariseConversation({ priorSummary = "", history = [], latestUser }) {
-  // Keep it short and useful for future turns
   const sys =
     "You maintain a rolling, 5-7 line concise summary of this user's ongoing conversation with Limi. " +
     "Capture: current topic(s), decisions made, open questions, and next likely steps. " +
@@ -139,7 +195,7 @@ async function summariseConversation({ priorSummary = "", history = [], latestUs
   return (c.choices?.[0]?.message?.content || "").trim().slice(0, 1500);
 }
 
-/** Compact memory snapshot for prompting */
+/** Prompt scaffolding */
 function memorySnapshotForPrompt(mem) {
   if (!mem) return "None";
   const parts = [];
@@ -155,7 +211,6 @@ function memorySnapshotForPrompt(mem) {
   return parts.length ? parts.join(" • ") : "None";
 }
 
-/** Friendly UK persona + behaviour (expanded) */
 function buildSystemPrompt(prior) {
   const snapshot = memorySnapshotForPrompt(prior);
   return [
@@ -170,7 +225,7 @@ function buildSystemPrompt(prior) {
   ].join("\n");
 }
 
-/** Lively micro follow-ups: 0–2 short suggestions tailored to the last reply */
+/** Micro follow-ups */
 async function suggestFollowUps({ userMsg, assistantReply }) {
   const sys =
     "Suggest up to TWO tiny follow-up options that would help the user take the next step. " +
@@ -186,7 +241,7 @@ async function suggestFollowUps({ userMsg, assistantReply }) {
   return lines;
 }
 
-/** Post-process to avoid dull replies; fallbacks remain */
+/** Post-process for admin-y acks only */
 function postProcessReply(reply, userMsg, prior) {
   const r = (reply || "").trim();
   const lower = r.toLowerCase();
@@ -504,7 +559,7 @@ function extractNameQuick(text = "") {
   return null;
 }
 
-/* ===================== EMERGENCY CONTACTS (kept) ===================== */
+/* ===================== EMERGENCY CONTACTS ===================== */
 async function emgExtractNatural(text = "") {
   const sys =
     'Return ONLY compact JSON like {"intent":"add|remove|list|none","name":"...","phone":"...","channel":"sms|whatsapp|both"}.' +
@@ -583,7 +638,7 @@ async function removeEmergencyContact(userId, name) {
   return true;
 }
 
-// 2-minute cooldown using debug_logs
+// 2-minute cooldown
 async function canSendAlert(userId) {
   const twoMinAgo = new Date(Date.now() - 2*60*1000).toISOString();
   const { data } = await supabase
@@ -629,7 +684,7 @@ async function sendEmergencyAlert({ userId, from }) {
   }
 }
 
-/* ---- emergency command parsing (kept for power users) ---- */
+/* ---- emergency command parsing (power users) ---- */
 function parseAddEmergency(text = "") {
   const t = text.trim();
   const reA = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
@@ -803,7 +858,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- Emergency power-user regex (still supported)
+    // --- Emergency power-user regex
     const addEmg = parseAddEmergency(body);
     if (addEmg) {
       await dbg("emg_upsert_req", addEmg, userId);
@@ -956,19 +1011,23 @@ export default async function handler(req, res) {
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
     const messages = [
       { role: "system", content: buildSystemPrompt(prior) },
-      ...history.slice(-15), // last 15 turns verbatim
+      ...history.slice(-15),
       { role: "user", content: userContent },
     ];
 
-    // ===== Main answer =====
+    // ===== Main answer (now on GPT-5 Nano by default) =====
     const completion = await safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 });
-    let reply = completion.choices[0].message.content?.trim() || "OK";
+    let reply = completion.choices[0].message.content?.trim() || "";
+
+    // Enforce minimum length BEFORE post-processing
+    reply = await expandIfShort({ reply, userMsg });
+
+    // Keep admin-y ack behaviour
     reply = postProcessReply(reply, userMsg, prior);
 
-    // ===== Optional micro follow-ups (cheap, short) =====
+    // ===== Optional micro follow-ups =====
     let followLines = [];
     try {
-      // Only bother if the reply is not a pure acknowledgement
       if (!/^all set|got it/i.test(reply)) {
         followLines = await suggestFollowUps({ userMsg, assistantReply: reply });
       }
@@ -980,7 +1039,6 @@ export default async function handler(req, res) {
     let finalReply = reply;
     if (followLines.length) {
       finalReply += "\n\nWould you like me to:\n" + followLines.map((l, i) => `${i+1}) ${l}`).join("\n");
-      // Keep under ~1200 chars to be safe on platforms that split long messages
       if (finalReply.length > 1200) finalReply = finalReply.slice(0, 1190) + "…";
     }
 
@@ -989,9 +1047,9 @@ export default async function handler(req, res) {
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
 
-    // ===== Update rolling conversation summary (so Limi "remembers the chat", not just facts)
+    // ===== Update rolling conversation summary
     try {
-      const slimHistory = history.slice(-10); // summarise last handful + latest
+      const slimHistory = history.slice(-10);
       const newSummary = await summariseConversation({
         priorSummary: prior.convo_summary || "",
         history: slimHistory,
@@ -1003,7 +1061,7 @@ export default async function handler(req, res) {
       await dbg("convo_summary_error", { message: String(e) }, userId);
     }
 
-    // ===== Extract long-lived profile memory from user message
+    // ===== Extract long-lived profile memory
     try {
       const extracted = await extractMemory(prior, body);
       if (extracted && Object.keys(extracted).length) {
