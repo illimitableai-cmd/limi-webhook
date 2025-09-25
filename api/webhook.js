@@ -9,28 +9,32 @@ import { createClient } from "@supabase/supabase-js";
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
-const TWILIO_FROM = process.env.TWILIO_FROM;
 
-// ===== Models: default to GPT-5 Nano (supports text+image input, text output)
+// --- Twilio senders
+const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS/Mixed number (E.164)
+const TWILIO_WHATSAPP_FROM_RAW = (process.env.TWILIO_WHATSAPP_FROM || TWILIO_FROM || "").trim();
+const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
+  ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
+  : ""; // must be a WA-enabled sender
+
+// ===== Models
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-nano";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
-// Optional: allow pinning a snapshot via env
 const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-nano-2025-08-07";
 
-// ===== Feature flags =====
+// ===== Feature flags
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
+const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";   // NEW: stay on GPT-5 only
 
-// FREE TRIAL amount used when we first see a user with no credits row
+// FREE TRIAL
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 
-// ===== Minimum length + watchdogs =====
+// ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 const FORCE_DIRECT = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
-
-// ===== Time budgets =====
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 7000); // keep <= ~8s for Twilio
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 7000);
 
 // ---------- Small utils ----------
 function escapeXml(s = "") {
@@ -70,7 +74,33 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
     const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
     await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
-    // If upstream is unhealthy, jump straight to 4o-mini to save time.
+    // STRICT GPT-5 mode: do NOT switch to 4o-mini
+    if (STRICT_GPT5) {
+      // Try the pinned GPT-5 snapshot if different
+      if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
+        try {
+          const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
+          if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) { delete a2.max_tokens; delete a2.temperature; a2.max_completion_tokens = maxTokens; }
+          return await openai.chat.completions.create(a2);
+        } catch (e2) {
+          await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) });
+        }
+      }
+      // Last: retry vanilla gpt-5-nano once if we weren’t already on it
+      if (model !== "gpt-5-nano") {
+        try {
+          const a3 = { ...args, model: "gpt-5-nano" };
+          delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
+          return await openai.chat.completions.create(a3);
+        } catch (e3) {
+          await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) });
+        }
+      }
+      // Give up (caller will decide what to send)
+      throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
+    }
+
+    // Non-strict: jump to a healthy fast model on service hiccups.
     if (is503) {
       return await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -80,7 +110,6 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
       });
     }
 
-    // 1) Pinned snapshot
     if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
       try {
         const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
@@ -89,7 +118,6 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
       } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
     }
 
-    // 2) Plain gpt-5-nano
     if (model !== "gpt-5-nano") {
       try {
         const a3 = { ...args, model: "gpt-5-nano" };
@@ -98,7 +126,6 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
       } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
     }
 
-    // 3) Last resort: 4o-mini
     return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
   }
 }
@@ -126,13 +153,8 @@ async function forceAnswer(userMsg, priorSummary = "") {
   ].filter(Boolean).join("\n");
 
   const c = await safeChatCompletion({
-    model: CHAT_MODEL,
-    temperature: 0.1,
-    maxTokens: 220,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user",  content: userMsg }
-    ]
+    model: CHAT_MODEL, temperature: 0.1, maxTokens: 220,
+    messages: [{ role: "system", content: sys }, { role: "user", content: userMsg }]
   });
 
   return (c.choices?.[0]?.message?.content || "").trim();
@@ -141,13 +163,13 @@ async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPL
   let base = (reply || "").trim();
   if (base.length >= minChars && !looksLikeNonAnswer(base)) return base;
 
-  // Pass 2: force direct answer (time-bounded)
+  // Pass 2 (bounded)
   let forced = "";
   const f = await watchdog(forceAnswer(userMsg, priorSummary), budgetMs, "");
   if (typeof f === "string") forced = f.trim();
   if (forced.length >= minChars && !looksLikeNonAnswer(forced)) return forced;
 
-  // Pass 3: rewrite to enforce minimum length (time-bounded)
+  // Pass 3 (bounded)
   const sys = "Rewrite so it DIRECTLY answers the user's question in 1–3 concise UK-English sentences. No apologies.";
   const usr = `User: ${userMsg}\n\nDraft reply:\n${forced || base}\n\nRewrite (>= ${minChars} chars):`;
   try {
@@ -169,18 +191,19 @@ async function sendDirect({ channel, to, body }) {
   const safeBody = toGsm7(body);
   try {
     if (channel === "whatsapp") {
-      const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
+      const waFrom = TWILIO_WHATSAPP_FROM || ""; // must be WA-enabled
+      if (!waFrom) throw new Error("Missing TWILIO_WHATSAPP_FROM (WhatsApp sender)");
       const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
       const r = await twilioClient.messages.create({ from: waFrom, to: waTo, body: safeBody });
-      await dbg("direct_send_ok", { channel, sid: r.sid, to }, null);
+      await dbg("direct_send_ok", { channel, sid: r.sid, to, from: waFrom }, null);
       return true;
     } else {
       const r = await twilioClient.messages.create({ from: TWILIO_FROM, to, body: safeBody });
-      await dbg("direct_send_ok", { channel, sid: r.sid, to }, null);
+      await dbg("direct_send_ok", { channel, sid: r.sid, to, from: TWILIO_FROM }, null);
       return true;
     }
   } catch (e) {
-    await dbg("direct_send_error", { channel, to, message: String(e?.message || e) }, null);
+    await dbg("direct_send_error", { channel, to, message: String(e?.message || e), from: channel==="whatsapp"?TWILIO_WHATSAPP_FROM:TWILIO_FROM }, null);
     return false;
   }
 }
@@ -548,9 +571,9 @@ async function sendEmergencyAlert({ userId, from }) {
     const via = (c.channel || "both").toLowerCase();
     if (via === "sms" || via === "both") tasks.push(twilioClient.messages.create({ from: TWILIO_FROM, to, body: msg }));
     if (via === "whatsapp" || via === "both") {
-      const waFrom = TWILIO_FROM.startsWith("whatsapp:") ? TWILIO_FROM : `whatsapp:${TWILIO_FROM}`;
+      if (!TWILIO_WHATSAPP_FROM) { await dbg("emg_alert_error", { reason: "missing_wa_sender" }, userId); continue; }
       const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
-      tasks.push(twilioClient.messages.create({ from: waFrom, to: waTo, body: msg }));
+      tasks.push(twilioClient.messages.create({ from: TWILIO_WHATSAPP_FROM, to: waTo, body: msg }));
     }
   }
   try {
@@ -665,18 +688,24 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
-    // =================== BASIC MODE (pure chat, fast returns) ===================
+    // =================== BASIC MODE (fast chat) ===================
     if (BASIC_MODE) {
       const messages = [
         { role: "system", content: "You are Limi, a concise UK-English SMS assistant. Always answer directly." },
         { role: "user", content: body }
       ];
 
-      const c = await watchdog(
+      let c = await watchdog(
         safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }),
         LLM_TIMEOUT_MS,
         "Sorry—took too long to respond."
       );
+
+      // STRICT_GPT5: if call threw and bubbled (as plain object), send a clean error
+      if (!c?.choices && !c?.__timeout) {
+        await dbg("model_hard_error", { strict: STRICT_GPT5, detail: c }, userId);
+        c = { __timeout: false, content: "I’m having trouble reaching the model right now. Please try again in a moment." };
+      }
 
       let reply = (c?.choices?.[0]?.message?.content || c?.content || "").trim();
       const timedOut = !!c?.__timeout;
@@ -729,7 +758,7 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // ----- Emergency NLU (gated) -----
+    // ----- Emergency paths (gated) -----
     if (ENABLE_EMERGENCY) {
       const emgNLU = await emgExtractNatural(body);
       if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
@@ -774,7 +803,6 @@ export default async function handler(req, res) {
         }
       }
 
-      // Emergency power-user regex
       const addEmg = parseAddEmergency(body);
       if (addEmg) {
         const r = await upsertEmergencyContact({ userId, ...addEmg });
@@ -796,7 +824,6 @@ export default async function handler(req, res) {
         return res.status(200).send("<Response/>");
       }
 
-      // Emergency list quick path
       if (isEmergencyContactListQuery(body)) {
         const list = await listEmergencyContacts(userId);
         let msg = "You have no emergency contacts yet.";
@@ -810,7 +837,6 @@ export default async function handler(req, res) {
         return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
       }
 
-      // Help trigger
       if (isHelpTrigger(body)) {
         const result = await sendEmergencyAlert({ userId, from });
         let msg = "";
@@ -824,9 +850,9 @@ export default async function handler(req, res) {
         res.setHeader("Content-Type","text/xml");
         return res.status(200).send("<Response/>");
       }
-    } // end emergency gate
+    }
 
-    // ----- Contact list quick path (gated) -----
+    // ----- Contacts (gated) -----
     if (ENABLE_CONTACTS && isContactListQuery(body)) {
       const { data: contacts, error: listErr } = await supabase
         .from("contacts")
@@ -851,7 +877,6 @@ export default async function handler(req, res) {
       return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // Fast contact save (regex + LLM fallback) — gated
     if (ENABLE_CONTACTS) {
       let contact = parseSaveContact(body);
       if (!contact) {
@@ -902,11 +927,18 @@ export default async function handler(req, res) {
     ];
 
     // ===== Main answer with watchdog
-    const completion = await watchdog(
+    let completion = await watchdog(
       safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }),
       LLM_TIMEOUT_MS,
       "Sorry—took too long to respond."
     );
+
+    // STRICT_GPT5: if we errored hard (thrown object bubbled), swap to canned message
+    if (!completion?.choices && !completion?.__timeout) {
+      await dbg("model_hard_error", { strict: STRICT_GPT5, detail: completion }, userId);
+      completion = { __timeout: false, content: "I’m having trouble reaching the model right now. Please try again in a moment." };
+    }
+
     let reply = "";
     let rawModelText = "";
     if (completion?.__timeout) {
@@ -918,13 +950,10 @@ export default async function handler(req, res) {
       reply = rawModelText;
     }
 
-    // Log raw model output (short snippet)
     await dbg("model_reply_raw", { len: (rawModelText || "").length, snippet: (rawModelText || "").slice(0, 160) }, userId);
 
-    // Make sure we give a direct answer (2 more passes if needed, with bounded time)
     reply = await expandIfShort({ reply, userMsg, priorSummary: prior.convo_summary || "" });
 
-    // Final compose
     let finalReply = reply;
     if (finalReply.length > 1200) finalReply = finalReply.slice(0, 1190) + "…";
 
@@ -951,7 +980,7 @@ export default async function handler(req, res) {
       const ok = await sendDirect({ channel, to: from, body: finalReply + footer });
       await dbg("direct_send_forced", { ok, to: from }, userId);
       res.setHeader("Content-Type","text/xml");
-      return res.status(200).send("<Response/>"); // prevent double-send
+      return res.status(200).send("<Response/>");
     }
 
     res.setHeader("Content-Type","text/xml");
