@@ -26,14 +26,15 @@ const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
-const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";   // NEW: stay on GPT-5 only
+const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";          // stay on GPT-5 only
+const FORCE_DIRECT      = process.env.TWILIO_FORCE_DIRECT_SEND === "1";      // for SMS
+const FORCE_DIRECT_WHATSAPP = process.env.FORCE_DIRECT_WHATSAPP === "1";     // NEW: for WhatsApp
 
 // FREE TRIAL
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 
 // ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
-const FORCE_DIRECT = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 7000);
 
 // ---------- Small utils ----------
@@ -74,7 +75,7 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
     const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
     await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
-    // STRICT GPT-5 mode: do NOT switch to 4o-mini
+    // STRICT GPT-5 mode: do NOT switch to other families
     if (STRICT_GPT5) {
       // Try the pinned GPT-5 snapshot if different
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
@@ -191,7 +192,7 @@ async function sendDirect({ channel, to, body }) {
   const safeBody = toGsm7(body);
   try {
     if (channel === "whatsapp") {
-      const waFrom = TWILIO_WHATSAPP_FROM || ""; // must be WA-enabled
+      const waFrom = TWILIO_WHATSAPP_FROM || "";
       if (!waFrom) throw new Error("Missing TWILIO_WHATSAPP_FROM (WhatsApp sender)");
       const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
       const r = await twilioClient.messages.create({ from: waFrom, to: waTo, body: safeBody });
@@ -494,8 +495,7 @@ function isHelpTrigger(text="") { return /^\s*help!?$/i.test(text); }
 // -------------- Emergency contacts --------------
 async function emgExtractNatural(text = "") {
   const sys =
-    'Return ONLY compact JSON like {"intent":"add|remove|list|none","name":"...","phone":"...","channel":"sms|whatsapp|both"}.' +
-    " Infer intent from natural language about emergency contacts.";
+    'Return ONLY compact JSON like {"intent":"add|remove|list|none","name":"...","phone":"...","channel":"sms|whatsapp|both"}. Infer intent from natural language about emergency contacts.';
   const user = `Text: ${text}`;
   try {
     const c = await safeChatCompletion({
@@ -723,6 +723,14 @@ export default async function handler(req, res) {
 
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", reply, channel, from);
+
+      // Delivery for BASIC_MODE
+      if ((channel === "sms" && FORCE_DIRECT) || (channel === "whatsapp" && FORCE_DIRECT_WHATSAPP)) {
+        const ok = await sendDirect({ channel, to: from, body: reply });
+        await dbg("direct_send_forced", { ok, to: from, channel }, userId);
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send("<Response/>");
+      }
 
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send(`<Response><Message>${escapeXml(toGsm7(reply))}</Message></Response>`);
@@ -957,7 +965,7 @@ export default async function handler(req, res) {
     let finalReply = reply;
     if (finalReply.length > 1200) finalReply = finalReply.slice(0, 1190) + "…";
 
-    await dbg("reply_out", { channel, to: from, reply: finalReply, FORCE_DIRECT }, userId);
+    await dbg("reply_out", { channel, to: from, reply: finalReply, FORCE_DIRECT_SMS: FORCE_DIRECT, FORCE_DIRECT_WHATSAPP }, userId);
 
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
@@ -976,11 +984,11 @@ export default async function handler(req, res) {
     if (!latestMem?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
 
     // Delivery
-    if (FORCE_DIRECT && channel === "sms") {
+    if ((channel === "sms" && FORCE_DIRECT) || (channel === "whatsapp" && FORCE_DIRECT_WHATSAPP)) {
       const ok = await sendDirect({ channel, to: from, body: finalReply + footer });
-      await dbg("direct_send_forced", { ok, to: from }, userId);
+      await dbg("direct_send_forced", { ok, to: from, channel }, userId);
       res.setHeader("Content-Type","text/xml");
-      return res.status(200).send("<Response/>");
+      return res.status(200).send("<Response/>"); // prevent double-send
     }
 
     res.setHeader("Content-Type","text/xml");
