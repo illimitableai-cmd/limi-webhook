@@ -11,11 +11,11 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 
 // --- Twilio senders
-const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS/Mixed number (E.164)
+const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS number (E.164)
 const TWILIO_WHATSAPP_FROM_RAW = (process.env.TWILIO_WHATSAPP_FROM || TWILIO_FROM || "").trim();
 const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
   ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
-  : ""; // must be a WA-enabled sender
+  : "";
 
 // ===== Models
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-nano";
@@ -26,16 +26,15 @@ const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
-const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";          // stay on GPT-5 only
-const FORCE_DIRECT      = process.env.TWILIO_FORCE_DIRECT_SEND === "1";      // for SMS
-const FORCE_DIRECT_WHATSAPP = process.env.FORCE_DIRECT_WHATSAPP === "1";     // NEW: for WhatsApp
+const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";
 
 // FREE TRIAL
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 
 // ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 7000);
+const FORCE_DIRECT    = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
+const LLM_TIMEOUT_MS  = Number(process.env.LLM_TIMEOUT_MS || 7000);
 
 // ---------- Small utils ----------
 function escapeXml(s = "") {
@@ -75,40 +74,26 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
     const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
     await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
-    // STRICT GPT-5 mode: do NOT switch to other families
     if (STRICT_GPT5) {
-      // Try the pinned GPT-5 snapshot if different
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
         try {
           const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
           if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) { delete a2.max_tokens; delete a2.temperature; a2.max_completion_tokens = maxTokens; }
           return await openai.chat.completions.create(a2);
-        } catch (e2) {
-          await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) });
-        }
+        } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
       }
-      // Last: retry vanilla gpt-5-nano once if we weren’t already on it
       if (model !== "gpt-5-nano") {
         try {
           const a3 = { ...args, model: "gpt-5-nano" };
           delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
           return await openai.chat.completions.create(a3);
-        } catch (e3) {
-          await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) });
-        }
+        } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
       }
-      // Give up (caller will decide what to send)
       throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
     }
 
-    // Non-strict: jump to a healthy fast model on service hiccups.
     if (is503) {
-      return await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages,
-        temperature: 0.2,
-        max_tokens: maxTokens
-      });
+      return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
     }
 
     if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
@@ -164,13 +149,11 @@ async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPL
   let base = (reply || "").trim();
   if (base.length >= minChars && !looksLikeNonAnswer(base)) return base;
 
-  // Pass 2 (bounded)
   let forced = "";
   const f = await watchdog(forceAnswer(userMsg, priorSummary), budgetMs, "");
   if (typeof f === "string") forced = f.trim();
   if (forced.length >= minChars && !looksLikeNonAnswer(forced)) return forced;
 
-  // Pass 3 (bounded)
   const sys = "Rewrite so it DIRECTLY answers the user's question in 1–3 concise UK-English sentences. No apologies.";
   const usr = `User: ${userMsg}\n\nDraft reply:\n${forced || base}\n\nRewrite (>= ${minChars} chars):`;
   try {
@@ -187,7 +170,7 @@ async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPL
   }
 }
 
-// ---------- Twilio send helper ----------
+// ---------- Twilio send helpers ----------
 async function sendDirect({ channel, to, body }) {
   const safeBody = toGsm7(body);
   try {
@@ -207,6 +190,23 @@ async function sendDirect({ channel, to, body }) {
     await dbg("direct_send_error", { channel, to, message: String(e?.message || e), from: channel==="whatsapp"?TWILIO_WHATSAPP_FROM:TWILIO_FROM }, null);
     return false;
   }
+}
+
+// unified responder: try direct, else TwiML fallback (prevents WhatsApp black-hole)
+async function respondDirectOrTwiml(res, { channel, to, body, allowDirect }) {
+  let usedDirect = false, ok = false;
+  if (allowDirect) {
+    usedDirect = true;
+    ok = await sendDirect({ channel, to, body });
+  }
+  if (ok) {
+    await dbg("direct_send_forced", { ok: true, to, channel }, null);
+    res.setHeader("Content-Type","text/xml");
+    return res.status(200).send("<Response/>"); // already delivered
+  }
+  await dbg("twiml_fallback_used", { tried_direct: usedDirect, ok, channel }, null);
+  res.setHeader("Content-Type","text/xml");
+  return res.status(200).send(`<Response><Message>${escapeXml(toGsm7(body))}</Message></Response>`);
 }
 
 // ---------- Media fetch ----------
@@ -701,7 +701,6 @@ export default async function handler(req, res) {
         "Sorry—took too long to respond."
       );
 
-      // STRICT_GPT5: if call threw and bubbled (as plain object), send a clean error
       if (!c?.choices && !c?.__timeout) {
         await dbg("model_hard_error", { strict: STRICT_GPT5, detail: c }, userId);
         c = { __timeout: false, content: "I’m having trouble reaching the model right now. Please try again in a moment." };
@@ -723,14 +722,6 @@ export default async function handler(req, res) {
 
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", reply, channel, from);
-
-      // Delivery for BASIC_MODE
-      if ((channel === "sms" && FORCE_DIRECT) || (channel === "whatsapp" && FORCE_DIRECT_WHATSAPP)) {
-        const ok = await sendDirect({ channel, to: from, body: reply });
-        await dbg("direct_send_forced", { ok, to: from, channel }, userId);
-        res.setHeader("Content-Type","text/xml");
-        return res.status(200).send("<Response/>");
-      }
 
       res.setHeader("Content-Type","text/xml");
       return res.status(200).send(`<Response><Message>${escapeXml(toGsm7(reply))}</Message></Response>`);
@@ -785,18 +776,14 @@ export default async function handler(req, res) {
             : "Sorry, I couldn't save that emergency contact.";
           await saveTurn(userId, "user", body, channel, from);
           await saveTurn(userId, "assistant", msg, channel, from);
-          await sendDirect({ channel, to: from, body: msg });
-          res.setHeader("Content-Type","text/xml");
-          return res.status(200).send("<Response/>");
+          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: true });
         }
         if (emgNLU.intent === "remove" && emgNLU.name) {
           const ok = await removeEmergencyContact(userId, emgNLU.name);
           const msg = ok ? `Removed emergency contact: ${sanitizeName(emgNLU.name)}.` : "Sorry, I couldn't remove that emergency contact.";
           await saveTurn(userId, "user", body, channel, from);
           await saveTurn(userId, "assistant", msg, channel, from);
-          await sendDirect({ channel, to: from, body: msg });
-          res.setHeader("Content-Type","text/xml");
-          return res.status(200).send("<Response/>");
+          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: true });
         }
         if (emgNLU.intent === "list") {
           const list = await listEmergencyContacts(userId);
@@ -805,9 +792,7 @@ export default async function handler(req, res) {
             : "You have no emergency contacts yet. You can say things like “add my mum to my emergency contacts, 07123 456789”.";
           await saveTurn(userId, "user", body, channel, from);
           await saveTurn(userId, "assistant", msg, channel, from);
-          await sendDirect({ channel, to: from, body: msg });
-          res.setHeader("Content-Type","text/xml");
-          return res.status(200).send("<Response/>");
+          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: true });
         }
       }
 
@@ -817,9 +802,7 @@ export default async function handler(req, res) {
         const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`) : "Sorry, I couldn't save that emergency contact.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        await sendDirect({ channel, to: from, body: msg });
-        res.setHeader("Content-Type","text/xml");
-        return res.status(200).send("<Response/>");
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: true });
       }
       const remEmg = parseRemoveEmergency(body);
       if (remEmg) {
@@ -827,9 +810,7 @@ export default async function handler(req, res) {
         const msg = ok ? `Removed emergency contact: ${remEmg}.` : "Sorry, I couldn't remove that emergency contact.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        await sendDirect({ channel, to: from, body: msg });
-        res.setHeader("Content-Type","text/xml");
-        return res.status(200).send("<Response/>");
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: true });
       }
 
       if (isEmergencyContactListQuery(body)) {
@@ -854,9 +835,7 @@ export default async function handler(req, res) {
         else msg = "Sorry, I couldn't send the alert right now.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        await sendDirect({ channel, to: from, body: msg });
-        res.setHeader("Content-Type","text/xml");
-        return res.status(200).send("<Response/>");
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: true });
       }
     }
 
@@ -941,7 +920,6 @@ export default async function handler(req, res) {
       "Sorry—took too long to respond."
     );
 
-    // STRICT_GPT5: if we errored hard (thrown object bubbled), swap to canned message
     if (!completion?.choices && !completion?.__timeout) {
       await dbg("model_hard_error", { strict: STRICT_GPT5, detail: completion }, userId);
       completion = { __timeout: false, content: "I’m having trouble reaching the model right now. Please try again in a moment." };
@@ -965,7 +943,7 @@ export default async function handler(req, res) {
     let finalReply = reply;
     if (finalReply.length > 1200) finalReply = finalReply.slice(0, 1190) + "…";
 
-    await dbg("reply_out", { channel, to: from, reply: finalReply, FORCE_DIRECT_SMS: FORCE_DIRECT, FORCE_DIRECT_WHATSAPP }, userId);
+    await dbg("reply_out", { channel, to: from, reply: finalReply, FORCE_DIRECT }, userId);
 
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
@@ -983,12 +961,9 @@ export default async function handler(req, res) {
     const latestMem = (await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle()).data?.summary;
     if (!latestMem?.name && channel === "whatsapp") footer = "\n\n(What’s your first name so I can save it?)";
 
-    // Delivery
-    if ((channel === "sms" && FORCE_DIRECT) || (channel === "whatsapp" && FORCE_DIRECT_WHATSAPP)) {
-      const ok = await sendDirect({ channel, to: from, body: finalReply + footer });
-      await dbg("direct_send_forced", { ok, to: from, channel }, userId);
-      res.setHeader("Content-Type","text/xml");
-      return res.status(200).send("<Response/>"); // prevent double-send
+    // Delivery: SMS can be direct if requested, WA always safe via TwiML; if direct fails we fallback
+    if (channel === "sms" && FORCE_DIRECT) {
+      return respondDirectOrTwiml(res, { channel, to: from, body: finalReply + footer, allowDirect: true });
     }
 
     res.setHeader("Content-Type","text/xml");
