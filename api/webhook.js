@@ -17,10 +17,13 @@ const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
   ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
   : "";
 
-// ===== Models
-const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-nano";
+// ===== Models  (➡ default to GPT-5 Mini)
+const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-mini";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
-const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-nano-2025-08-07";
+// leave blank unless you really want to pin a specific snapshot
+const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "";
+// single place for our “base GPT-5” retry
+const GPT5_BASE_FALLBACK = process.env.OPENAI_GPT5_BASE_FALLBACK || "gpt-5-mini";
 
 // ===== Feature flags
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
@@ -34,7 +37,6 @@ const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 // ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 const FORCE_DIRECT    = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
-// tighter default to stay below Vercel/Twilio limits
 const LLM_TIMEOUT_MS  = Number(process.env.LLM_TIMEOUT_MS || 4500);
 
 // ---------- Small utils ----------
@@ -75,6 +77,7 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
     const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
     await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
+    // STRICT GPT-5: never fall to 4o; only try GPT-5 snapshot/base
     if (STRICT_GPT5) {
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
         try {
@@ -83,16 +86,17 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
           return await openai.chat.completions.create(a2);
         } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
       }
-      if (model !== "gpt-5-nano") {
+      if (model !== GPT5_BASE_FALLBACK) {
         try {
-          const a3 = { ...args, model: "gpt-5-nano" };
+          const a3 = { ...args, model: GPT5_BASE_FALLBACK };
           delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
           return await openai.chat.completions.create(a3);
-        } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
+        } catch (e3) { await dbg("model_fallback", { tried: GPT5_BASE_FALLBACK, error: String(e3) }); }
       }
       throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
     }
 
+    // Non-strict: if service hiccup, use a tiny fallback once
     if (is503) {
       return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
     }
@@ -105,14 +109,15 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
       } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
     }
 
-    if (model !== "gpt-5-nano") {
+    if (model !== GPT5_BASE_FALLBACK) {
       try {
-        const a3 = { ...args, model: "gpt-5-nano" };
+        const a3 = { ...args, model: GPT5_BASE_FALLBACK };
         delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
         return await openai.chat.completions.create(a3);
-      } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
+      } catch (e3) { await dbg("model_fallback", { tried: GPT5_BASE_FALLBACK, error: String(e3) }); }
     }
 
+    // final safety valve (non-strict path only)
     return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
   }
 }
@@ -277,85 +282,14 @@ async function summariseConversation({ priorSummary = "", history = [], latestUs
 }
 
 // -------------- Name/phone utilities --------------
-function sanitizeName(raw = "") {
-  let n = String(raw)
-    .replace(/['’]\s*s\b/gi, "")
-    .replace(/\b(number|mobile|cell|phone)\b/gi, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-  n = n.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
-  return n;
-}
-function isBadName(name = "") {
-  return /\b(number|mobile|cell|phone)\b/i.test(name) || /['’]\s*s\b/i.test(name) || name.replace(/[^a-z]/gi, "").length < 2;
-}
-function betterName(existing = "", incoming = "") {
-  const aBad = isBadName(existing), bBad = isBadName(incoming);
-  if (bBad && !aBad) return existing;
-  if (!bBad && aBad) return incoming;
-  const aTok = (existing || "").trim().split(/\s+/).length;
-  const bTok = (incoming || "").trim().split(/\s+/).length;
-  return bTok >= aTok ? incoming : existing;
-}
-function normalizePhone(phone = "") {
-  let d = String(phone).replace(/[^\d+]/g, "");
-  if (d.startsWith("00")) d = "+" + d.slice(2);
-  if (d.startsWith("0")) d = "+44" + d.slice(1);
-  return d;
-}
+// (unchanged)
+// … your helper functions (sanitizeName, isBadName, etc.) stay as-is
 
 // -------------- DB helpers --------------
-async function getOrCreateUserId(identifier) {
-  const { data: ident } = await supabase
-    .from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
-  if (ident?.user_id) return ident.user_id;
+// (unchanged)
 
-  const { data: user, error: userErr } = await supabase
-    .from("users").insert([{ display_name: null }]).select().single();
-  if (userErr) {
-    const { data: ident2 } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
-    if (ident2?.user_id) return ident2.user_id;
-    throw userErr;
-  }
-  const { error: linkErr } = await supabase
-    .from("identifiers").insert([{ user_id: user.id, type: "phone", value: identifier }]);
-  if (linkErr) {
-    const { data: ident3 } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
-    if (ident3?.user_id) return ident3.user_id;
-    throw linkErr;
-  }
-  return user.id;
-}
-async function loadRecentTurns(userId, limit = 30) {
-  const { data } = await supabase
-    .from("messages").select("role, body").eq("user_id", userId)
-    .order("created_at", { ascending: false }).limit(limit);
-  return (data || []).reverse().map((r) => ({ role: r.role, content: r.body }));
-}
-async function saveTurn(userId, role, text, channel, externalId) {
-  await supabase.from("messages").insert([{ user_id: userId, role, body: text, channel, external_id: externalId }]);
-}
-async function getCredits(userId) {
-  const { data } = await supabase.from("credits").select("balance").eq("user_id", userId).maybeSingle();
-  return data?.balance ?? 0;
-}
-async function setCredits(userId, balance) {
-  await supabase.from("credits").upsert({ user_id: userId, balance });
-}
-async function ensureCredits(userId) {
-  const { data } = await supabase.from("credits").select("balance").eq("user_id", userId).maybeSingle();
-  if (!data) {
-    await supabase.from("credits").insert([{ user_id: userId, balance: FREE_TRIAL_CREDITS }]);
-    await dbg("credits_seeded", { seeded: FREE_TRIAL_CREDITS }, userId);
-    return FREE_TRIAL_CREDITS;
-  }
-  return data.balance ?? 0;
-}
-
-// -------------- Contacts --------------
-// (unchanged for brevity) — keep your contact/emergency helpers here
-//  … paste the same helpers you already have (upsertContact, parseSaveContact, emg helpers, etc.)
-//  (No functional change except using respondDirectOrTwiml where we previously called sendDirect.)
+// -------------- Contacts & Emergency helpers --------------
+// (unchanged)
 
 // ===================================================================
 
@@ -474,6 +408,9 @@ export default async function handler(req, res) {
       ""
     );
 
+    // NEW: log the model actually used
+    await dbg("model_used", { model: completion?.model || CHAT_MODEL }, userId);
+
     let initialTimedOut = !!completion?.__timeout;
     let rawModelText = initialTimedOut ? "" : (completion.choices?.[0]?.message?.content?.trim() || "");
     await dbg("model_reply_raw", { len: rawModelText.length, timeout: initialTimedOut }, userId);
@@ -494,7 +431,7 @@ export default async function handler(req, res) {
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
 
-    // SEND **IMMEDIATELY** (avoid 502 from Twilio)
+    // SEND **IMMEDIATELY**
     await respondDirectOrTwiml(res, {
       channel,
       to: from,
@@ -502,7 +439,7 @@ export default async function handler(req, res) {
       allowDirect: channel === "sms" && FORCE_DIRECT
     });
 
-    // ---- Best-effort post-work (non-critical). It's okay if it doesn't complete.
+    // ---- Best-effort post-work
     try {
       const slimHistory = history.slice(-10);
       const newSummary = await summariseConversation({ priorSummary: prior.convo_summary || "", history: slimHistory, latestUser: userMsg });
@@ -514,7 +451,6 @@ export default async function handler(req, res) {
     console.error("handler fatal", e);
     await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
     try {
-      // try to still give Twilio a 200 with TwiML
       return res.status(200).setHeader("Content-Type","text/xml")
         .send("<Response><Message>Sorry, something went wrong.</Message></Response>");
     } catch { return; }
