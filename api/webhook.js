@@ -213,6 +213,71 @@ async function safeChatCompletion({
   }
 }
 
+// ---------- Timeout & answer-shaping helpers ----------
+function watchdog(promise, ms, onTimeoutMsg = "Sorry—took too long to respond.") {
+  let t;
+  const timeout = new Promise((r) => { t = setTimeout(() => r({ __timeout: true, content: onTimeoutMsg }), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+function looksLikeNonAnswer(txt = "") {
+  const t = (txt || "").toLowerCase().trim();
+  if (!t) return true;
+  return /(sorry|can't|cannot|couldn'?t|unsure|not (sure|certain)|don'?t know|no idea)/.test(t);
+}
+
+async function forceAnswer(userMsg, priorSummary = "") {
+  const sys = [
+    "You are Limi, a concise UK-English SMS assistant.",
+    "You MUST directly answer the user's question in 1–3 short sentences.",
+    "If it's a 'how many' question, reply with a concrete number or best estimate (e.g., 'about 60–70'), then 3–6 words of context.",
+    "Avoid hedging or apologies. No disclaimers. No 'as an AI'.",
+    "If the question is ambiguous, pick the most likely interpretation and state the answer.",
+    priorSummary ? `Conversation so far: ${priorSummary.slice(0, 600)}` : ""
+  ].filter(Boolean).join("\n");
+
+  const c = await safeChatCompletion({
+    model: CHAT_MODEL,
+    temperature: 0.1,         // ignored for GPT-5; used if model != GPT-5
+    maxTokens: 220,
+    messages: [{ role: "system", content: sys }, { role: "user", content: userMsg }]
+  });
+
+  return (c.choices?.[0]?.message?.content || "").trim();
+}
+
+async function expandIfShort({
+  reply, userMsg, priorSummary,
+  minChars = Number(process.env.MIN_REPLY_CHARS || 60),
+  budgetMs = Math.max(1200, Math.floor(Number(process.env.LLM_TIMEOUT_MS || 4500) / 2))
+}) {
+  let base = (reply || "").trim();
+  if (base.length >= minChars && !looksLikeNonAnswer(base)) return base;
+
+  // Pass 2 (bounded)
+  let forced = "";
+  const f = await watchdog(forceAnswer(userMsg, priorSummary), budgetMs, "");
+  if (typeof f === "string") forced = f.trim();
+  if (forced.length >= minChars && !looksLikeNonAnswer(forced)) return forced;
+
+  // Pass 3 (bounded)
+  const sys = "Rewrite so it DIRECTLY answers the user's question in 1–3 concise UK-English sentences. No apologies.";
+  const usr = `User: ${userMsg}\n\nDraft reply:\n${forced || base}\n\nRewrite (>= ${minChars} chars):`;
+  try {
+    const c = await watchdog(
+      safeChatCompletion({ model: CHAT_MODEL, messages: [{ role: "system", content: sys }, { role: "user", content: usr }], maxTokens: 220 }),
+      Math.max(800, Math.floor(budgetMs / 2)),
+      ""
+    );
+    const improved = (c?.choices?.[0]?.message?.content || c?.content || "").trim();
+    if (improved.length >= minChars && !looksLikeNonAnswer(improved)) return improved;
+    return improved || forced || base || "I’ll answer in a moment.";
+  } catch {
+    return forced || base || "I’ll answer in a moment.";
+  }
+}
+
+
 
 // ---------- Twilio send helper ----------
 async function sendDirect({ channel, to, body }) {
@@ -908,7 +973,7 @@ export default async function handler(req, res) {
 
     // Context
     const history = cleanHistory(await loadRecentTurns(userId, 40));
-    const userContent = visionPart ? [{ type: "input_text", text: userMsg }, visionPart] : userMsg;
+    const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
     const messages = [
       { role: "system", content: buildSystemPrompt(prior) },
       ...history.slice(-15),
