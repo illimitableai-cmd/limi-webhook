@@ -11,13 +11,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 
 // --- Twilio senders
-const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS number (E.164)
+const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS/Mixed number (E.164)
 const TWILIO_WHATSAPP_FROM_RAW = (process.env.TWILIO_WHATSAPP_FROM || TWILIO_FROM || "").trim();
 const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
   ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
-  : "";
+  : ""; // must be a WA-enabled sender
 
-// ===== Models (default to GPT-5 mini; snapshot stays in the family)
+// ===== Models: default to GPT-5 mini (snapshot stays in the family)
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-mini";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-mini-2025-08-07";
@@ -26,7 +26,7 @@ const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
-// Default to GPT-5-only behavior unless explicitly disabled
+// Keep fallbacks inside GPT-5 family unless explicitly disabled
 const STRICT_GPT5       = process.env.STRICT_GPT5 !== "0";
 
 // FREE TRIAL
@@ -60,7 +60,37 @@ async function dbg(step, payload, userId = null) {
   catch (e) { console.error("dbg fail", e); }
 }
 
-// ---------- OpenAI wrappers ----------
+// ---------- Responses API helpers (for GPT-5) ----------
+function mapMsgForResponses(m) {
+  const toText = (x) => (typeof x === "string" ? x : (x?.text ?? JSON.stringify(x)));
+  if (Array.isArray(m.content)) {
+    const parts = m.content.map((p) => {
+      if (p?.type === "image_url" && p?.image_url?.url) {
+        return { type: "input_image", image_url: p.image_url.url };
+      }
+      return { type: "input_text", text: toText(p) };
+    });
+    return { role: m.role, content: parts };
+  }
+  return { role: m.role, content: [{ type: "input_text", text: String(m.content ?? "") }] };
+}
+function collapseResponsesText(resp) {
+  if (resp?.output_text) return String(resp.output_text);
+  try {
+    const chunks = [];
+    for (const item of resp?.output ?? []) {
+      for (const c of item?.content ?? []) {
+        if (typeof c?.text === "string") chunks.push(c.text);
+        else if (typeof c?.output_text === "string") chunks.push(c.output_text);
+      }
+    }
+    const joined = chunks.join("");
+    if (joined) return joined;
+  } catch {}
+  return "";
+}
+
+// ---------- OpenAI wrapper ----------
 const GPT5_RE = /^gpt-5/i;
 
 async function safeChatCompletion({
@@ -71,76 +101,81 @@ async function safeChatCompletion({
 }) {
   const isGpt5 = GPT5_RE.test(model);
 
-  // Force plain text output to avoid non-text shapes
-  const base = {
-    model,
-    messages,
-    n: 1,
-    response_format: { type: "text" },
-    temperature: isGpt5 ? undefined : temperature,
-  };
+  // GPT-5 models -> Responses API
+  if (isGpt5) {
+    const input = messages.map(mapMsgForResponses);
+    const call = (mdl, outTok) =>
+      openai.responses.create({ model: mdl, input, temperature, max_output_tokens: outTok });
 
-  const args = isGpt5
-    ? { ...base, max_completion_tokens: maxTokens }
-    : { ...base, max_tokens: maxTokens };
+    try {
+      let resp = await call(model, maxTokens);
+      let text = collapseResponsesText(resp).trim();
+      await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
 
-  try {
-    let resp = await openai.chat.completions.create(args);
+      // retry once with a bump if empty/length-limited
+      if (!text) {
+        const bump = Math.min(maxTokens + 200, 800);
+        await dbg("model_retry_length", { bump });
+        resp = await call(model, bump);
+        text = collapseResponsesText(resp).trim();
+        await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
+      }
 
-    // Instrument + handle finish_reason/empties
-    const choice = resp?.choices?.[0];
-    const finish = choice?.finish_reason || null;
-    const content = (choice?.message?.content ?? "").trim();
-    await dbg("model_meta", {
-      model: resp?.model,
-      finish_reason: finish,
-      len: content.length,
-      usage: resp?.usage || null,
-    });
+      return {
+        choices: [{ message: { content: text }, finish_reason: text ? "stop" : "length" }],
+        model: resp?.model,
+        usage: resp?.usage,
+      };
+    } catch (err) {
+      const emsg = String(err?.message || err || "");
+      const is503 = /503|temporar(il)?y unavailable/i.test(emsg);
+      await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
-    // If we hit cap, retry once with a bump (stay small to fit SMS)
-    if (!content && finish === "length") {
-      const bump = Math.min(maxTokens + 180, 600);
-      const retryArgs = isGpt5
-        ? { ...args, max_completion_tokens: bump }
-        : { ...args, max_tokens: bump };
-      await dbg("model_retry_length", { bump });
-      resp = await openai.chat.completions.create(retryArgs);
-      return resp;
-    }
+      if (STRICT_GPT5) {
+        // snapshot
+        if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
+          try {
+            const r2 = await call(CHAT_SNAPSHOT_FALLBACK, maxTokens);
+            const t2 = collapseResponsesText(r2).trim();
+            return { choices: [{ message: { content: t2 }, finish_reason: t2 ? "stop" : "length" }] };
+          } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
+        }
+        // nano (still GPT-5)
+        if (model !== "gpt-5-nano") {
+          try {
+            const r3 = await call("gpt-5-nano", maxTokens);
+            const t3 = collapseResponsesText(r3).trim();
+            return { choices: [{ message: { content: t3 }, finish_reason: t3 ? "stop" : "length" }] };
+          } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
+        }
+        throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
+      }
 
-    return resp;
+      // non-strict: fall back to a healthy 4o-mini only for service hiccups
+      if (is503) {
+        return await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages,
+          temperature: 0.2,
+          max_tokens: maxTokens,
+          response_format: { type: "text" },
+        });
+      }
 
-  } catch (err) {
-    const emsg = String(err?.message || err || "");
-    const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
-    await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
-
-    // STRICT GPT-5: never fall back to 4o
-    if (STRICT_GPT5) {
-      // 1) Pinned snapshot
+      // try snapshot -> nano -> 4o-mini
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
         try {
-          const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
-          if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) {
-            delete a2.max_tokens; a2.max_completion_tokens = maxTokens;
-          }
-          return await openai.chat.completions.create(a2);
-        } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
+          const r5 = await call(CHAT_SNAPSHOT_FALLBACK, maxTokens);
+          const t5 = collapseResponsesText(r5).trim();
+          return { choices: [{ message: { content: t5 }, finish_reason: t5 ? "stop" : "length" }] };
+        } catch {}
       }
-      // 2) vanilla nano (still GPT-5 family)
-      if (model !== "gpt-5-nano") {
-        try {
-          const a3 = { ...args, model: "gpt-5-nano" };
-          delete a3.max_tokens; a3.max_completion_tokens = maxTokens;
-          return await openai.chat.completions.create(a3);
-        } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
-      }
-      throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
-    }
+      try {
+        const r6 = await call("gpt-5-nano", maxTokens);
+        const t6 = collapseResponsesText(r6).trim();
+        return { choices: [{ message: { content: t6 }, finish_reason: t6 ? "stop" : "length" }] };
+      } catch {}
 
-    // Non-strict: fall back to 4o-mini only for service hiccups
-    if (is503) {
       return await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages,
@@ -149,24 +184,16 @@ async function safeChatCompletion({
         response_format: { type: "text" },
       });
     }
+  }
 
-    // Try snapshot, then nano, then 4o-mini
-    if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
-      try {
-        const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
-        if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) {
-          delete a2.max_tokens; a2.max_completion_tokens = maxTokens;
-        }
-        return await openai.chat.completions.create(a2);
-      } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
-    }
-    if (model !== "gpt-5-nano") {
-      try {
-        const a3 = { ...args, model: "gpt-5-nano" };
-        delete a3.max_tokens; a3.max_completion_tokens = maxTokens;
-        return await openai.chat.completions.create(a3);
-      } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
-    }
+  // Non-GPT-5 -> Chat Completions
+  try {
+    return await openai.chat.completions.create({
+      model, messages, temperature, max_tokens: maxTokens, response_format: { type: "text" },
+    });
+  } catch (err) {
+    const emsg = String(err?.message || err || "");
+    await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
     return await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
@@ -233,12 +260,12 @@ async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPL
   }
 }
 
-// ---------- Twilio send helpers ----------
+// ---------- Twilio send helper ----------
 async function sendDirect({ channel, to, body }) {
   const safeBody = toGsm7(body);
   try {
     if (channel === "whatsapp") {
-      const waFrom = TWILIO_WHATSAPP_FROM || "";
+      const waFrom = TWILIO_WHATSAPP_FROM || ""; // must be WA-enabled
       if (!waFrom) throw new Error("Missing TWILIO_WHATSAPP_FROM (WhatsApp sender)");
       const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
       const r = await twilioClient.messages.create({ from: waFrom, to: waTo, body: safeBody });
@@ -255,7 +282,7 @@ async function sendDirect({ channel, to, body }) {
   }
 }
 
-// Try direct (if allowed). If it fails, immediately answer with TwiML.
+// Try direct (if allowed). If it fails (or not allowed), immediately answer with TwiML.
 async function respondDirectOrTwiml(res, { channel, to, body, allowDirect }) {
   let usedDirect = false, ok = false;
   if (allowDirect) { usedDirect = true; ok = await sendDirect({ channel, to, body }); }
@@ -424,7 +451,9 @@ async function upsertContact({ userId, name, phone, channel }) {
     if (byPhone) {
       const finalName = betterName(byPhone.name || "", tidyIncoming);
       const needsUpdate = finalName !== (byPhone.name || "") || (byPhone.channel || "") !== (channel || "");
-      if (needsUpdate) await supabase.from("contacts").update({ name: finalName, channel }).eq("id", byPhone.id);
+      if (needsUpdate) {
+        await supabase.from("contacts").update({ name: finalName, channel }).eq("id", byPhone.id);
+      }
       await dbg("contact_upsert_ok", { action: "update_by_phone", name: finalName, phone: normPhone, channel }, userId);
       return { ok: true, action: "update_by_phone" };
     }
@@ -458,7 +487,6 @@ function parseSaveContact(msg) {
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
     /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
-    /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
     /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
     /save\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
     /add\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
