@@ -62,40 +62,31 @@ async function dbg(step, payload, userId = null) {
 
 // ---------- Responses API helpers (for GPT-5) ----------
 function mapMsgForResponses(m) {
-  const toText = (x) => (typeof x === "string" ? x : (x?.text ?? JSON.stringify(x)));
+  const toText = (x) =>
+    typeof x === "string" ? x : (x?.text ?? JSON.stringify(x));
 
-  // Normalise to array-of-parts shape used by Responses API
-  const arr = Array.isArray(m.content)
+  // Always work with an array of parts
+  const partsIn = Array.isArray(m.content)
     ? m.content
-    : [{ type: "text", text: toText(m.content) }];
+    : [{ type: "input_text", text: toText(m.content) }];
 
-  const parts = arr.map((p) => {
-    // Images: allow both { image_url: "..." } and { image_url: { url: "..." } }
+  const partsOut = partsIn.map((p) => {
+    // Allow both shapes for images: { image_url: "..." } or { image_url: { url: "..." } }
     if (p?.type === "image_url" && p?.image_url) {
       const url = typeof p.image_url === "string" ? p.image_url : p.image_url.url;
       return { type: "input_image", image_url: url };
     }
-    // TEXT PARTS MUST BE type: "text" for Responses API
-    return { type: "text", text: toText(p) };
+
+    // Normalise any text-like part to Responses API's input_text
+    const txt =
+      typeof p === "string" ? p :
+      (p.text ?? p.content ?? toText(p));
+    return { type: "input_text", text: String(txt ?? "") };
   });
 
-  return { role: m.role, content: parts };
+  return { role: m.role, content: partsOut };
 }
-function collapseResponsesText(resp) {
-  if (resp?.output_text) return String(resp.output_text);
-  try {
-    const chunks = [];
-    for (const item of resp?.output ?? []) {
-      for (const c of item?.content ?? []) {
-        if (typeof c?.text === "string") chunks.push(c.text);
-        else if (typeof c?.output_text === "string") chunks.push(c.output_text);
-      }
-    }
-    const joined = chunks.join("");
-    if (joined) return joined;
-  } catch {}
-  return "";
-}
+
 
 // ---------- OpenAI wrapper ----------
 const GPT5_RE = /^gpt-5/i;
