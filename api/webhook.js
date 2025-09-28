@@ -76,7 +76,7 @@ function extractResponseText(resp) {
 
   if (typeof resp.output_text === "string" && resp.output_text) chunks.push(resp.output_text);
   if (Array.isArray(resp.output)) visit(resp.output);
-  if (!chunks.length) visit(resp);
+  if (!chunks.length && typeof resp === "object") visit(resp);
 
   return chunks.join("").trim();
 }
@@ -126,34 +126,36 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // Attempt 1 — Force JSON output via text.format=json_object, then parse { "final": "..." }
+  // Attempt 1 — Force JSON output; include the literal word "JSON" in *input messages*
   const paramsJson = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
+    // Even though we set instructions, the validator for text.format checks input messages,
+    // so we also add a system primer in the input that contains "JSON".
     instructions:
       "Respond ONLY as a single JSON object with this exact shape: {\"final\":\"...\"}. " +
       "Do not include any other keys, markdown, or text outside JSON. " +
       "Put the final human-facing answer in the \"final\" field.",
-    text: { format: { type: "json_object" } }, // request visible JSON text channel
-    input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
+    text: { format: "json_object" }, // request visible JSON text channel
+    input: [
+      {
+        role: "system",
+        content: [
+          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object." }
+        ]
+      },
+      { role: "user", content: [{ type: "input_text", text: userMsg }]}
+    ],
   };
   let r = await callWithTimeout(paramsJson, "gpt5_jsonfmt");
   if (r?.__timeout) {
     await dbg("gpt5_timeout", { attempt: "jsonfmt", ms: LLM_TIMEOUT_MS });
     return "Sorry—took too long to respond.";
   }
-  if (r?.__error) {
-    const msg = String(r.__error?.message || r.__error);
-    await dbg("gpt5_error", { attempt: "jsonfmt", message: msg });
-    // If the snapshot dislikes text/format, fall through to next attempts.
-    if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(msg)) {
-      return "Model error: " + msg;
-    }
-  } else {
+  if (!r?.__error) {
     const all = extractResponseText(r);
     let final = "";
     try {
-      // Model may return JSON either as output_text or inside a text node
       const start = all.indexOf("{"); const end = all.lastIndexOf("}");
       const raw = (start >= 0 && end >= 0) ? all.slice(start, end + 1) : all;
       const j = JSON.parse(raw);
@@ -165,6 +167,9 @@ export async function gpt5Reply(userMsg) {
       preview: (final||"").slice(0,160)
     });
     if (final) return final;
+  } else {
+    // DO NOT return early on any JSON-format error; fall through to plain text attempts
+    await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
   }
 
   // Attempt 2 — items with input_text (no text.format) + <final> contract
@@ -243,6 +248,7 @@ export default async function handler(req, res) {
       Body = j.Body ?? j.body ?? "";
       From = j.From ?? j.from ?? "";
       if (j.channel === "whatsapp" && From && !/^whatsapp:/i.test(From)) From = `whatsapp:${From}`;
+      NumMedia = Number(j.NumMedia || j.numMedia || 0);
     } else {
       const p = new URLSearchParams(raw);
       Body = p.get("Body");
