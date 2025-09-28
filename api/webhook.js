@@ -11,24 +11,22 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 
 // --- Twilio senders
-const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
+const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // E.164 for SMS
 const TWILIO_WHATSAPP_FROM_RAW = (process.env.TWILIO_WHATSAPP_FROM || TWILIO_FROM || "").trim();
 const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
   ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
   : "";
 
-// ===== Models  (➡ default to GPT-5 Mini)
+// ===== Models (default: GPT-5 mini)
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-mini";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
-// leave blank unless you really want to pin a specific snapshot
-const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "";
-// single place for our “base GPT-5” retry
-const GPT5_BASE_FALLBACK = process.env.OPENAI_GPT5_BASE_FALLBACK || "gpt-5-mini";
+const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-mini-2025-08-07";
 
 // ===== Feature flags
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
+// Keep responses inside GPT-5 family (mini → snapshot → nano). No 4o fallback when =1
 const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";
 
 // FREE TRIAL
@@ -37,12 +35,11 @@ const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 // ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 const FORCE_DIRECT    = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
+// Tight timeout to avoid Twilio/Vercel timeouts
 const LLM_TIMEOUT_MS  = Number(process.env.LLM_TIMEOUT_MS || 4500);
 
-// ---------- Small utils ----------
-function escapeXml(s = "") {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// ---------- tiny utils ----------
+function escapeXml(s = "") { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function toGsm7(s = "") {
   return (s || "")
     .replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
@@ -61,7 +58,7 @@ async function dbg(step, payload, userId = null) {
   catch (e) { console.error("dbg fail", e); }
 }
 
-// ---------- OpenAI wrappers ----------
+// ---------- OpenAI wrapper ----------
 const GPT5_RE = /^gpt-5/i;
 
 async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.2, maxTokens = 220 }) {
@@ -77,8 +74,9 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
     const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
     await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
-    // STRICT GPT-5: never fall to 4o; only try GPT-5 snapshot/base
+    // STRICT mode: keep inside GPT-5 family only
     if (STRICT_GPT5) {
+      // 1) pinned snapshot (still GPT-5)
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
         try {
           const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
@@ -86,21 +84,26 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
           return await openai.chat.completions.create(a2);
         } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
       }
-      if (model !== GPT5_BASE_FALLBACK) {
+      // 2) nano as a last-ditch within family
+      if (model !== "gpt-5-nano") {
         try {
-          const a3 = { ...args, model: GPT5_BASE_FALLBACK };
+          const a3 = { ...args, model: "gpt-5-nano" };
           delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
           return await openai.chat.completions.create(a3);
-        } catch (e3) { await dbg("model_fallback", { tried: GPT5_BASE_FALLBACK, error: String(e3) }); }
+        } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
       }
+      // Give up (caller handles)
       throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
     }
 
-    // Non-strict: if service hiccup, use a tiny fallback once
+    // Non-strict: final fallback to 4o-mini if a 503/hiccup
     if (is503) {
-      return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
+      return await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages, temperature: 0.2, max_tokens: maxTokens
+      });
     }
-
+    // Else try snapshot then nano
     if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
       try {
         const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
@@ -108,16 +111,13 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 
         return await openai.chat.completions.create(a2);
       } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
     }
-
-    if (model !== GPT5_BASE_FALLBACK) {
+    if (model !== "gpt-5-nano") {
       try {
-        const a3 = { ...args, model: GPT5_BASE_FALLBACK };
+        const a3 = { ...args, model: "gpt-5-nano" };
         delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
         return await openai.chat.completions.create(a3);
-      } catch (e3) { await dbg("model_fallback", { tried: GPT5_BASE_FALLBACK, error: String(e3) }); }
+      } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
     }
-
-    // final safety valve (non-strict path only)
     return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
   }
 }
@@ -178,7 +178,7 @@ async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPL
   }
 }
 
-// ---------- Twilio send helpers ----------
+// ---------- Twilio send & respond ----------
 async function sendDirect({ channel, to, body }) {
   const safeBody = toGsm7(body);
   try {
@@ -199,8 +199,6 @@ async function sendDirect({ channel, to, body }) {
     return false;
   }
 }
-
-// Try direct (if allowed). If it fails (or not allowed), immediately answer with TwiML.
 async function respondDirectOrTwiml(res, { channel, to, body, allowDirect }) {
   let usedDirect = false, ok = false;
   if (allowDirect) { usedDirect = true; ok = await sendDirect({ channel, to, body }); }
@@ -225,7 +223,7 @@ async function fetchTwilioMediaB64(url) {
   return buf.toString("base64");
 }
 
-// ---------- Memory + snapshot ----------
+// ---------- Memory snapshot ----------
 function blankMemory() {
   return { name: null, location: null, email: null, birthday: null, timezone: null, preferences: {}, interests: [], goals: [], notes: [], convo_summary: "", last_seen: new Date().toISOString() };
 }
@@ -281,15 +279,351 @@ async function summariseConversation({ priorSummary = "", history = [], latestUs
   return (c.choices?.[0]?.message?.content || "").trim().slice(0, 1200);
 }
 
-// -------------- Name/phone utilities --------------
-// (unchanged)
-// … your helper functions (sanitizeName, isBadName, etc.) stay as-is
+// -------------- Name/phone & contacts --------------
+function sanitizeName(raw = "") {
+  let n = String(raw)
+    .replace(/['’]\s*s\b/gi, "")
+    .replace(/\b(number|mobile|cell|phone)\b/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  n = n.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  return n;
+}
+function isBadName(name = "") {
+  return /\b(number|mobile|cell|phone)\b/i.test(name) || /['’]\s*s\b/i.test(name) || name.replace(/[^a-z]/gi, "").length < 2;
+}
+function betterName(existing = "", incoming = "") {
+  const aBad = isBadName(existing), bBad = isBadName(incoming);
+  if (bBad && !aBad) return existing;
+  if (!bBad && aBad) return incoming;
+  const aTok = (existing || "").trim().split(/\s+/).length;
+  const bTok = (incoming || "").trim().split(/\s+/).length;
+  return bTok >= aTok ? incoming : existing;
+}
+function normalizePhone(phone = "") {
+  let d = String(phone).replace(/[^\d+]/g, "");
+  if (d.startsWith("00")) d = "+" + d.slice(2);
+  if (d.startsWith("0")) d = "+44" + d.slice(1);
+  return d;
+}
 
-// -------------- DB helpers --------------
-// (unchanged)
+// DB helpers
+async function getOrCreateUserId(identifier) {
+  const { data: ident } = await supabase
+    .from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+  if (ident?.user_id) return ident.user_id;
 
-// -------------- Contacts & Emergency helpers --------------
-// (unchanged)
+  const { data: user, error: userErr } = await supabase
+    .from("users").insert([{ display_name: null }]).select().single();
+  if (userErr) {
+    const { data: ident2 } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+    if (ident2?.user_id) return ident2.user_id;
+    throw userErr;
+  }
+  const { error: linkErr } = await supabase
+    .from("identifiers").insert([{ user_id: user.id, type: "phone", value: identifier }]);
+  if (linkErr) {
+    const { data: ident3 } = await supabase.from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
+    if (ident3?.user_id) return ident3.user_id;
+    throw linkErr;
+  }
+  return user.id;
+}
+async function loadRecentTurns(userId, limit = 30) {
+  const { data } = await supabase
+    .from("messages").select("role, body").eq("user_id", userId)
+    .order("created_at", { ascending: false }).limit(limit);
+  return (data || []).reverse().map((r) => ({ role: r.role, content: r.body }));
+}
+async function saveTurn(userId, role, text, channel, externalId) {
+  await supabase.from("messages").insert([{ user_id: userId, role, body: text, channel, external_id: externalId }]);
+}
+async function getCredits(userId) {
+  const { data } = await supabase.from("credits").select("balance").eq("user_id", userId).maybeSingle();
+  return data?.balance ?? 0;
+}
+async function setCredits(userId, balance) {
+  await supabase.from("credits").upsert({ user_id: userId, balance });
+}
+async function ensureCredits(userId) {
+  const { data } = await supabase.from("credits").select("balance").eq("user_id", userId).maybeSingle();
+  if (!data) {
+    await supabase.from("credits").insert([{ user_id: userId, balance: FREE_TRIAL_CREDITS }]);
+    await dbg("credits_seeded", { seeded: FREE_TRIAL_CREDITS }, userId);
+    return FREE_TRIAL_CREDITS;
+  }
+  return data.balance ?? 0;
+}
+
+// Contacts helpers
+async function upsertContact({ userId, name, phone, channel }) {
+  const tidyIncoming = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
+  try {
+    const { data: byPhone } = await supabase
+      .from("contacts").select("id,name,phone,channel")
+      .eq("user_id", userId).eq("phone", normPhone).maybeSingle();
+
+    if (byPhone) {
+      const finalName = betterName(byPhone.name || "", tidyIncoming);
+      const needsUpdate = finalName !== (byPhone.name || "") || (byPhone.channel || "") !== (channel || "");
+      if (needsUpdate) await supabase.from("contacts").update({ name: finalName, channel }).eq("id", byPhone.id);
+      await dbg("contact_upsert_ok", { action: "update_by_phone", name: finalName, phone: normPhone, channel }, userId);
+      return { ok: true, action: "update_by_phone" };
+    }
+
+    const { data: byName } = await supabase
+      .from("contacts").select("id,name,phone,channel")
+      .eq("user_id", userId).ilike("name", tidyIncoming);
+
+    const existingByName = (byName || []).find((r) => (r.name || "").trim().toLowerCase() === tidyIncoming.toLowerCase());
+    if (existingByName) {
+      await supabase.from("contacts").update({ phone: normPhone, channel }).eq("id", existingByName.id);
+      await dbg("contact_upsert_ok", { action: "update_by_name", name: existingByName.name, phone: normPhone, channel }, userId);
+      return { ok: true, action: "update_by_name" };
+    }
+
+    await supabase.from("contacts").insert({ user_id: userId, name: tidyIncoming, phone: normPhone, channel });
+    await dbg("contact_upsert_ok", { action: "insert_new", name: tidyIncoming, phone: normPhone, channel }, userId);
+    return { ok: true, action: "insert_new" };
+  } catch (e) {
+    await dbg("contact_upsert_exception", { message: String(e?.message || e) }, userId);
+    return { ok: false, error: e };
+  }
+}
+function parseSaveContact(msg) {
+  const text = (msg || "").trim();
+  const phoneMatch = text.match(/(\+?\d[\d\s().-]{6,})/);
+  let phone = phoneMatch ? phoneMatch[1] : null;
+
+  const patterns = [
+    /(?:save|add)?\s*([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*['’]\s*s\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s*(?:number|mobile|cell|phone)?\s*(?:is|:)?\s*(\+?\d[\d\s().-]{6,})/i,
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
+    /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+a\s+contact\b/i,
+    /add\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\s+as\s+contact\b/i,
+    /save\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
+    /add\s+contact\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})\b/i,
+    /save\s+([a-zA-Z][a-zA-Z\s'’-]{1,60})[\s,]+(\+?\d[\d\s().-]{6,})/i,
+  ];
+
+  let name = null;
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (!m) continue;
+    if (m[2]) phone = m[2];
+    if (m[1]) name = m[1];
+    break;
+  }
+  if (!name || !phone) return null;
+
+  const tidyName = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
+  if (isBadName(tidyName)) return null;
+  return { name: tidyName, phone: normPhone };
+}
+async function llmExtractContact(msg) {
+  const sys = 'Return ONLY compact JSON like {"name":"...","phone":"..."} if the text asks to save/add a contact; otherwise {}. Phone must include country code.';
+  const user = `Text: ${msg}`;
+  const c = await safeChatCompletion({
+    model: MEMORY_MODEL,
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    maxTokens: 80,
+  });
+  try {
+    const t = c.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    const j = JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+    if (j?.name && j?.phone) {
+      const tidyName = sanitizeName(j.name);
+      const normPhone = normalizePhone(String(j.phone));
+      if (!isBadName(tidyName)) return { name: tidyName, phone: normPhone };
+    }
+  } catch {}
+  return null;
+}
+
+// Intent helpers
+function isContactListQuery(text = "") {
+  const t = (text || "").trim().toLowerCase();
+  return (
+    /^contacts$/.test(t) ||
+    /^contact\s+list$/.test(t) ||
+    /^my\s+contacts$/.test(t) ||
+    /^show\s+contacts$/.test(t) ||
+    /(^|\b)(show|list|see|view|display)\s+(my\s+)?contacts(\b|$)/i.test(text) ||
+    /(^|\b)can\s+i\s+have\s+(my\s+)?contact\s+list(\b|$)/i.test(text) ||
+    /(^|\b)contacts\s+please(\b|$)/i.test(text) ||
+    /\bwhat('?| i)?s?\s+my\s+contact\s+list\??$/i.test(text) ||
+    /\bwhat\s+is\s+my\s+contact\s+list\??$/i.test(text) ||
+    /\bwho\s+is\s+in\s+my\s+contacts\??$/i.test(text)
+  );
+}
+const NAME_STOPWORDS = new Set([
+  "ok","okay","k","thanks","thank you","ta","cheers","yes","yeah","yep","no","nope",
+  "hello","hi","hey","yo","sup","test","testing","help","buy","contacts","contact","list"
+]);
+function isLikelyName(text = "") {
+  const t = (text || "").trim();
+  if (!/^[a-zA-Z][a-zA-Z'’-]{1,60}(?:\s+[a-zA-Z][a-zA-Z'’-]{1,60}){0,2}$/.test(t)) return false;
+  return !NAME_STOPWORDS.has(t.toLowerCase());
+}
+function extractNameQuick(text = "") {
+  const t = (text || "").trim();
+  const patterns = [
+    /\bmy\s+name\s+is\s+([a-z][a-z\s'’-]{2,60})$/i,
+    /\bit['’]s\s+([a-z][a-z\s'’-]{2,60})$/i,
+    /\bi['’]m\s+([a-z][a-z\s'’-]{2,60})$/i,
+    /\bi\s+am\s+([a-z][a-z\s'’-]{2,60})$/i,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m && m[1]) {
+      const name = sanitizeName(m[1]);
+      if (!isBadName(name)) return name;
+    }
+  }
+  if (isLikelyName(t)) {
+    const name = sanitizeName(t);
+    if (!isBadName(name)) return name;
+  }
+  return null;
+}
+function isHelpTrigger(text="") { return /^\s*help!?$/i.test(text); }
+
+// -------------- Emergency contacts --------------
+async function emgExtractNatural(text = "") {
+  const sys =
+    'Return ONLY compact JSON like {"intent":"add|remove|list|none","name":"...","phone":"...","channel":"sms|whatsapp|both"}. Infer intent from natural language about emergency contacts.';
+  const user = `Text: ${text}`;
+  try {
+    const c = await safeChatCompletion({
+      model: MEMORY_MODEL,
+      messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+      maxTokens: 90,
+    });
+    const t = c.choices[0].message.content || "{}";
+    const s = t.indexOf("{"), e = t.lastIndexOf("}");
+    return JSON.parse(s >= 0 && e >= 0 ? t.slice(s, e + 1) : "{}");
+  } catch {
+    return { intent: "none" };
+  }
+}
+async function listEmergencyContacts(userId) {
+  const { data } = await supabase
+    .from("emergency_contacts")
+    .select("name, phone, channel")
+    .eq("user_id", userId)
+    .order("name", { ascending: true });
+  return (data || []);
+}
+async function upsertEmergencyContact({ userId, name, phone, channel = "both" }) {
+  const tidyName = sanitizeName(name);
+  const normPhone = normalizePhone(phone);
+
+  const { data: byPhone } = await supabase
+    .from("emergency_contacts")
+    .select("id,name,phone,channel")
+    .eq("user_id", userId)
+    .eq("phone", normPhone)
+    .maybeSingle();
+
+  if (byPhone) {
+    await supabase.from("emergency_contacts").update({ name: tidyName, channel }).eq("id", byPhone.id);
+    return { ok:true, action:"update_phone" };
+  }
+
+  const { error } = await supabase
+    .from("emergency_contacts")
+    .insert({ user_id: userId, name: tidyName, phone: normPhone, channel });
+  if (error) return { ok:false };
+  return { ok:true, action:"insert" };
+}
+async function removeEmergencyContact(userId, name) {
+  const tidy = sanitizeName(name);
+  const { error } = await supabase.from("emergency_contacts").delete().eq("user_id", userId).ilike("name", tidy);
+  return !error;
+}
+async function canSendAlert(userId) {
+  const twoMinAgo = new Date(Date.now() - 2*60*1000).toISOString();
+  const { data } = await supabase
+    .from("debug_logs")
+    .select("created_at")
+    .eq("user_id", userId)
+    .eq("step", "emg_alert_sent")
+    .gte("created_at", twoMinAgo)
+    .limit(1);
+  return !(data && data.length);
+}
+async function sendEmergencyAlert({ userId, from }) {
+  const allowed = await canSendAlert(userId);
+  if (!allowed) return { ok:false, reason:"cooldown" };
+
+  const contacts = await listEmergencyContacts(userId);
+  if (!contacts.length) return { ok:false, reason:"no_contacts" };
+
+  const msg = "⚠️ EMERGENCY ALERT\nThis is an automated message from Limi.\nPlease try to contact this number: " + from;
+
+  const tasks = [];
+  for (const c of contacts) {
+    const to = normalizePhone(c.phone);
+    const via = (c.channel || "both").toLowerCase();
+    if (via === "sms" || via === "both") tasks.push(twilioClient.messages.create({ from: TWILIO_FROM, to, body: msg }));
+    if (via === "whatsapp" || via === "both") {
+      if (!TWILIO_WHATSAPP_FROM) { await dbg("emg_alert_error", { reason: "missing_wa_sender" }, userId); continue; }
+      const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
+      tasks.push(twilioClient.messages.create({ from: TWILIO_WHATSAPP_FROM, to: waTo, body: msg }));
+    }
+  }
+  try {
+    await Promise.allSettled(tasks);
+    await dbg("emg_alert_sent", { count: contacts.length }, userId);
+    return { ok:true, count: contacts.length };
+  } catch (e) {
+    await dbg("emg_alert_error", { message: String(e) }, userId);
+    return { ok:false, reason:"twilio_error" };
+  }
+}
+function parseAddEmergency(text = "") {
+  const t = text.trim();
+  const reA = /add\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})\s+(\+?\d[\d\s().-]{6,})(?:\s+(sms|whatsapp|both))?$/i;
+  const reB = /add\s+emergency\s+contact\s+(\+?\d[\d\s().-]{6,})\s+([a-z][a-z\s'’-]{1,60})(?:\s+(sms|whatsapp|both))?$/i;
+
+  let m = t.match(reA);
+  if (m) {
+    const name = sanitizeName(m[1]);
+    const phone = normalizePhone(m[2]);
+    const channel = (m[3] || "both").toLowerCase();
+    if (isBadName(name)) return null;
+    return { name, phone, channel };
+  }
+  m = t.match(reB);
+  if (m) {
+    const name = sanitizeName(m[2]);
+    const phone = normalizePhone(m[1]);
+    const channel = (m[3] || "both").toLowerCase();
+    if (isBadName(name)) return null;
+    return { name, phone, channel };
+  }
+  return null;
+}
+function parseRemoveEmergency(text="") {
+  const re = /(?:remove|delete)\s+emergency\s+contact\s+([a-z][a-z\s'’-]{1,60})$/i;
+  const m = text.trim().match(re);
+  return m ? sanitizeName(m[1]) : null;
+}
+function isEmergencyContactListQuery(text = "") {
+  const t = (text || "").trim();
+  if (/^\s*(emergency\s+contacts|ice\s+contacts)\s*$/i.test(t)) return true;
+  if (/(^|\b)(show|list|see|view|display)\s+(my\s+)?(emergency|ice)\s+contacts(\b|$)/i.test(t)) return true;
+  if (/(^|\b)can\s+i\s+have\s+(my\s+)?(emergency|ice)\s+contacts(\b|$)/i.test(t)) return true;
+  if (/\bwho\s+is\s+in\s+my\s+(emergency|ice)\s+contacts\??$/i.test(t)) return true;
+  if (/\bwhat('?| i)?s?\s+my\s+(emergency|ice)\s+contact\s+list\??$/i.test(t)) return true;
+  if (/\bwhat\s+is\s+my\s+(emergency|ice)\s+contact\s+list\??$/i.test(t)) return true;
+  if (/(^|\b)(in\s+case\s+of\s+)?emergency\s+contact(s)?\s+list(\b|$)/i.test(t)) return true;
+  return false;
+}
 
 // ===================================================================
 
@@ -361,7 +695,150 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
     }
 
-    // BASIC fast path
+    // QUICK “name” save
+    const quickName = extractNameQuick(body);
+    if (quickName) {
+      const { data: memRow0 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
+      const hasName = !!memRow0?.summary?.name;
+      if (!hasName) {
+        const prior0 = memRow0?.summary ?? blankMemory();
+        const merged0 = mergeMemory(prior0, { name: quickName });
+        await supabase.from("memories").upsert({ user_id: userId, summary: merged0 });
+        await upsertContact({ userId, name: quickName, phone: from, channel });
+        const ack = `Nice to meet you, ${quickName}. I’ll remember that.`;
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", ack, channel, from);
+        return respondDirectOrTwiml(res, { channel, to: from, body: ack, allowDirect: channel === "sms" && FORCE_DIRECT });
+      }
+    }
+
+    // “What is my name?”
+    if (/^\s*what('?| i)?s?\s+my\s+name\??\s*$/i.test(body) || /^\s*what\s+is\s+my\s+name\??\s*$/i.test(body)) {
+      const { data: memRow1 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
+      const name = memRow1?.summary?.name;
+      const msg = name ? `Your name is ${name}.` : "I don’t have your name yet. What’s your first name so I can save it?";
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: channel === "sms" && FORCE_DIRECT });
+    }
+
+    // ----- Emergency paths -----
+    if (ENABLE_EMERGENCY) {
+      const emgNLU = await emgExtractNatural(body);
+      if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
+        if (emgNLU.intent === "add" && emgNLU.name && emgNLU.phone) {
+          const channelPref = (emgNLU.channel || "both").toLowerCase();
+          const r = await upsertEmergencyContact({
+            userId,
+            name: emgNLU.name,
+            phone: emgNLU.phone,
+            channel: ["sms","whatsapp","both"].includes(channelPref) ? channelPref : "both",
+          });
+          const msg = r.ok
+            ? (r.action === "insert" || r.action === "update_phone" ? `Added emergency contact: ${sanitizeName(emgNLU.name)}.` : `Updated emergency contact: ${sanitizeName(emgNLU.name)}.`)
+            : "Sorry, I couldn't save that emergency contact.";
+          await saveTurn(userId, "user", body, channel, from);
+          await saveTurn(userId, "assistant", msg, channel, from);
+          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        }
+        if (emgNLU.intent === "remove" && emgNLU.name) {
+          const ok = await removeEmergencyContact(userId, emgNLU.name);
+          const msg = ok ? `Removed emergency contact: ${sanitizeName(emgNLU.name)}.` : "Sorry, I couldn't remove that emergency contact.";
+          await saveTurn(userId, "user", body, channel, from);
+          await saveTurn(userId, "assistant", msg, channel, from);
+          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        }
+        if (emgNLU.intent === "list") {
+          const list = await listEmergencyContacts(userId);
+          const msg = list.length
+            ? "🚨 Emergency Contacts:\n" + list.map(c => `- ${sanitizeName(c.name)}: ${normalizePhone(c.phone)} (${c.channel||'both'})`).join("\n")
+            : "You have no emergency contacts yet. You can say things like “add my mum to my emergency contacts, 07123 456789”.";
+          await saveTurn(userId, "user", body, channel, from);
+          await saveTurn(userId, "assistant", msg, channel, from);
+          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        }
+      }
+
+      const addEmg = parseAddEmergency(body);
+      if (addEmg) {
+        const r = await upsertEmergencyContact({ userId, ...addEmg });
+        const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`) : "Sorry, I couldn't save that emergency contact.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+      }
+      const remEmg = parseRemoveEmergency(body);
+      if (remEmg) {
+        const ok = await removeEmergencyContact(userId, remEmg);
+        const msg = ok ? `Removed emergency contact: ${remEmg}.` : "Sorry, I couldn't remove that emergency contact.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+      }
+      if (isEmergencyContactListQuery(body)) {
+        const list = await listEmergencyContacts(userId);
+        let msg = "You have no emergency contacts yet.";
+        if (list.length) {
+          const rows = list.map(c => `- ${sanitizeName(c.name || "")}: ${normalizePhone(c.phone || "")} (${c.channel || "both"})`);
+          msg = "🚨 Emergency Contacts:\n" + rows.join("\n");
+        } else msg += " Add one like: add emergency contact Alex +447700900000 sms";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+      }
+      if (isHelpTrigger(body)) {
+        const result = await sendEmergencyAlert({ userId, from });
+        let msg = "";
+        if (result.ok) msg = `Alert sent to ${result.count} emergency contact(s).`;
+        else if (result.reason === "cooldown") msg = "Emergency alert was just sent. Please wait a moment before sending another.";
+        else if (result.reason === "no_contacts") msg = "You have no emergency contacts yet. Add one first: add emergency contact Alex +447700900000";
+        else msg = "Sorry, I couldn't send the alert right now.";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", msg, channel, from);
+        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+      }
+    }
+
+    // Contacts list
+    if (ENABLE_CONTACTS && isContactListQuery(body)) {
+      const { data: contacts, error: listErr } = await supabase
+        .from("contacts")
+        .select("name, phone")
+        .eq("user_id", userId)
+        .order("name", { ascending: true })
+        .limit(200);
+
+      let msg = "No contacts saved yet.";
+      if (!listErr && Array.isArray(contacts) && contacts.length) {
+        const rows = contacts.map(c => `- ${sanitizeName(c.name || "")}: ${normalizePhone(c.phone || "")}`);
+        msg = "📇 Your Contacts:\n" + rows.join("\n");
+      } else if (listErr) {
+        await dbg("contacts_list_error", { code: listErr.code, message: listErr.message }, userId);
+        msg = "Sorry, couldn't fetch contacts right now.";
+      }
+
+      await saveTurn(userId, "user", body, channel, from);
+      await saveTurn(userId, "assistant", msg, channel, from);
+      return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+    }
+
+    // Possible “save contact”
+    if (ENABLE_CONTACTS) {
+      let contact = parseSaveContact(body);
+      if (!contact) {
+        try { contact = await llmExtractContact(body); if (contact) await dbg("contact_llm_extracted", contact, userId); }
+        catch (e) { await dbg("contact_llm_extract_error", { message: String(e) }, userId); }
+      }
+      if (contact) {
+        const result = await upsertContact({ userId, name: contact.name, phone: contact.phone, channel });
+        const verb = result?.action === "insert_new" ? "Saved" : "Updated";
+        await saveTurn(userId, "user", body, channel, from);
+        await saveTurn(userId, "assistant", `${verb} ${contact.name}`, channel, from);
+        return respondDirectOrTwiml(res, { channel, to: from, body: `${verb} ${contact.name}`, allowDirect: false });
+      }
+    }
+
+    // BASIC fast path (if enabled)
     if (BASIC_MODE) {
       const messages = [
         { role: "system", content: "You are Limi, a concise UK-English SMS assistant. Always answer directly." },
@@ -375,7 +852,7 @@ export default async function handler(req, res) {
       return respondDirectOrTwiml(res, { channel, to: from, body: reply, allowDirect: channel === "sms" && FORCE_DIRECT });
     }
 
-    // Memory + media
+    // === Full chat ===
     const { data: memRow } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
     const prior = memRow?.summary ?? blankMemory();
 
@@ -392,7 +869,6 @@ export default async function handler(req, res) {
 
     await saveTurn(userId, "user", userMsg, channel, from);
 
-    // Context
     const history = cleanHistory(await loadRecentTurns(userId, 40));
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
     const messages = [
@@ -401,25 +877,18 @@ export default async function handler(req, res) {
       { role: "user", content: userContent },
     ];
 
-    // ===== Main answer (bounded)
     let completion = await watchdog(
       safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }),
       LLM_TIMEOUT_MS,
       ""
     );
 
-    // NEW: log the model actually used
-    await dbg("model_used", { model: completion?.model || CHAT_MODEL }, userId);
-
-    let initialTimedOut = !!completion?.__timeout;
+    const initialTimedOut = !!completion?.__timeout;
     let rawModelText = initialTimedOut ? "" : (completion.choices?.[0]?.message?.content?.trim() || "");
     await dbg("model_reply_raw", { len: rawModelText.length, timeout: initialTimedOut }, userId);
 
-    // If first pass timed out or empty, don't do more model work—reply fast
-    let reply = rawModelText;
-    if (!reply) reply = "I’ll answer in a moment.";
+    let reply = rawModelText || "I’ll answer in a moment.";
     if (!initialTimedOut && reply === rawModelText) {
-      // only expand when we actually got something back and we still need more
       reply = await expandIfShort({ reply, userMsg, priorSummary: prior.convo_summary || "" });
     }
 
@@ -431,7 +900,7 @@ export default async function handler(req, res) {
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
 
-    // SEND **IMMEDIATELY**
+    // send immediately to avoid 502s
     await respondDirectOrTwiml(res, {
       channel,
       to: from,
@@ -439,7 +908,7 @@ export default async function handler(req, res) {
       allowDirect: channel === "sms" && FORCE_DIRECT
     });
 
-    // ---- Best-effort post-work
+    // best-effort summary (out of band)
     try {
       const slimHistory = history.slice(-10);
       const newSummary = await summariseConversation({ priorSummary: prior.convo_summary || "", history: slimHistory, latestUser: userMsg });
@@ -451,8 +920,8 @@ export default async function handler(req, res) {
     console.error("handler fatal", e);
     await dbg("handler_fatal", { message: String(e?.message || e), stack: e?.stack || null });
     try {
-      return res.status(200).setHeader("Content-Type","text/xml")
-        .send("<Response><Message>Sorry, something went wrong.</Message></Response>");
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response><Message>Sorry, something went wrong.</Message></Response>");
     } catch { return; }
   }
 }
