@@ -9,7 +9,7 @@ import { createClient } from "@supabase/supabase-js";
  * Required: OPENAI_KEY, TWILIO_SID, TWILIO_AUTH, TWILIO_FROM
  * Optional: TWILIO_WHATSAPP_FROM (format: whatsapp:+447...)
  * Optional: OPENAI_CHAT_MODEL (default: gpt-5-nano), LLM_TIMEOUT_MS
- * For debug logs: SUPABASE_URL, SUPABASE_KEY and a table `debug_logs`
+ * For debug logs: SUPABASE_URL, SUPABASE_KEY and table `debug_logs`
  */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano";
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini in Vercel to use mini
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -66,44 +66,77 @@ function collapseResponsesText(resp) {
   } catch { return ""; }
 }
 
-/* ---------------- OpenAI (Responses API) ---------------- */
+/* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
 async function gpt5Reply(userMsg) {
-  const input = [
-    { role: "user", content: [{ type: "input_text", text: userMsg }] }
-  ];
+  const baseParams = {
+    model: CHAT_MODEL,
+    instructions: "You are a concise assistant. Always produce a short, direct text answer. Output text only.",
+    modalities: ["text"],
+    max_output_tokens: 220
+  };
 
-  const params = { model: CHAT_MODEL, input, max_output_tokens: 220 };
+  // First attempt
+  const params1 = {
+    ...baseParams,
+    input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
+  };
 
   await dbg("gpt5_request", { model: CHAT_MODEL, input_preview: userMsg.slice(0,160) });
 
-  const p = openai.responses.create(params);
-  const withTimeout = new Promise((resolve) => {
+  const p1 = openai.responses.create(params1);
+  const r1 = await new Promise((resolve) => {
     const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-    p.then((r) => { clearTimeout(t); resolve(r); })
-     .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+    p1.then((r) => { clearTimeout(t); resolve(r); })
+      .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
   });
 
-  const resp = await withTimeout;
+  if (r1?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS }); return "Sorry—took too long to respond."; }
+  if (r1?.__error)   { const m = String(r1.__error?.message || r1.__error); await dbg("gpt5_error", { message: m }); return `Model error: ${m}`; }
 
-  if (resp?.__timeout) {
-    await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS });
-    return "Sorry—took too long to respond.";
-  }
-  if (resp?.__error) {
-    const msg = String(resp.__error?.message || resp.__error);
-    await dbg("gpt5_error", { message: msg });
-    return `Model error: ${msg}`;
-  }
-
-  const text = collapseResponsesText(resp).trim();
+  let text = collapseResponsesText(r1).trim();
   await dbg("gpt5_reply", {
-    model: resp?.model || CHAT_MODEL,
-    usage: resp?.usage || null,
+    model: r1?.model || CHAT_MODEL,
+    usage: r1?.usage || null,
+    len: text.length,
+    preview: text.slice(0,160)
+  });
+  if (text) return text;
+
+  // Retry once with stricter system hint
+  const params2 = {
+    ...baseParams,
+    instructions: "Answer the user's question directly in 1–2 short sentences. Output TEXT ONLY.",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: "Return a direct answer as plain text." }]},
+      { role: "user",   content: [{ type: "input_text", text: userMsg }]},
+    ],
+  };
+
+  await dbg("gpt5_retry", { reason: "empty_text_first_attempt" });
+
+  const p2 = openai.responses.create(params2);
+  const r2 = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ __timeout: true }), Math.max(3000, Math.floor(LLM_TIMEOUT_MS/2)));
+    p2.then((r) => { clearTimeout(t); resolve(r); })
+      .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+  });
+
+  if (r2?.__timeout) { await dbg("gpt5_timeout_retry", {}); return "Sorry—took too long to respond."; }
+  if (r2?.__error)   { const m = String(r2.__error?.message || r2.__error); await dbg("gpt5_error_retry", { message: m }); return `Model error: ${m}`; }
+
+  text = collapseResponsesText(r2).trim();
+  await dbg("gpt5_reply_retry", {
+    model: r2?.model || CHAT_MODEL,
+    usage: r2?.usage || null,
     len: text.length,
     preview: text.slice(0,160)
   });
 
-  return text || "I’m here.";
+  if (!text) {
+    // fail-fast log so we can see it clearly
+    await dbg("gpt5_empty_after_retry", { model: r2?.model || CHAT_MODEL });
+  }
+  return text || "I’ll keep it brief: I couldn’t generate a response.";
 }
 
 /* ---------------- Twilio send (WA direct) ---------------- */
@@ -124,6 +157,7 @@ export default async function handler(req, res) {
     let Body=null, From=null, NumMedia=0;
 
     if (raw.trim().startsWith("{")) {
+      // JSON test mode
       const j = JSON.parse(raw);
       Body = j.Body ?? j.body ?? "";
       From = j.From ?? j.from ?? "";
@@ -140,7 +174,7 @@ export default async function handler(req, res) {
     const isWhatsApp = /^whatsapp:/i.test(From);
     const cleanFrom = smsNumber(From);
 
-    await dbg("webhook_in", { channel: isWhatsApp ? "whatsapp" : "sms", from: cleanFrom, body_len: Body.length, numMedia: NumMedia });
+    await dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
 
     if (!Body) {
       res.setHeader("Content-Type","text/xml");
@@ -148,6 +182,7 @@ export default async function handler(req, res) {
       return;
     }
 
+    // Simple MMS guard for UK SMS
     if (!isWhatsApp && NumMedia > 0) {
       res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
