@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // rolling GPT-5
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -53,35 +53,33 @@ function smsNumber(s="") {
 }
 
 /* ---------------- Robust extractor for Responses API ---------------- */
-// Deep-walk any modern Responses payload and collect visible text.
 function extractResponseText(resp) {
   if (!resp) return "";
-  const chunks = [];
+  if (typeof resp.output_text === "string" && resp.output_text) return resp.output_text.trim();
 
+  const chunks = [];
   const visit = (node) => {
     if (!node || typeof node !== "object") return;
 
-    if (typeof node.output_text === "string" && node.output_text) chunks.push(node.output_text);
+    // common text fields
     if (typeof node.text === "string" && node.text) chunks.push(node.text);
+    if (typeof node.output_text === "string" && node.output_text) chunks.push(node.output_text);
 
+    // arrays / nested content
     if (Array.isArray(node)) { for (const it of node) visit(it); return; }
     if (Array.isArray(node.content)) { for (const it of node.content) visit(it); }
-    if (node.assistant_response && typeof node.assistant_response === "object") { visit(node.assistant_response); }
+    if (node.assistant_response && typeof node.assistant_response === "object") visit(node.assistant_response);
 
     for (const k of Object.keys(node)) {
       const v = node[k];
       if (v && typeof v === "object") visit(v);
     }
   };
-
-  if (typeof resp.output_text === "string" && resp.output_text) chunks.push(resp.output_text);
   if (Array.isArray(resp.output)) visit(resp.output);
   if (!chunks.length && typeof resp === "object") visit(resp);
 
   return chunks.join("").trim();
 }
-
-// Compact summary of content types present (to see where text may hide)
 function summariseContentTypes(resp) {
   const counts = {};
   const visit = (node) => {
@@ -126,18 +124,17 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // --- Attempt 1: JSON via response_format (requires the word "JSON" in input messages)
+  // Attempt 1 — JSON via top-level text.format (validator needs the word "json/JSON" in input)
   const paramsJson = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
-    response_format: { type: "json_object" }, // ✅ supported in Responses/Chat APIs
-    instructions:
-      "You are an SMS assistant. Output JSON only.",
+    text: { format: { type: "json_object" } }, // ✅ correct for Responses API
+    instructions: "You are an SMS assistant. Output JSON only.",
     input: [
       {
         role: "system",
         content: [
-          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." } // ✅ contains “JSON”
+          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." } // contains “JSON”
         ]
       },
       { role: "user", content: [{ type: "input_text", text: userMsg }]}
@@ -157,7 +154,7 @@ export async function gpt5Reply(userMsg) {
       const raw = (start >= 0 && end >= 0) ? all.slice(start, end + 1) : all;
       const j = JSON.parse(raw);
       if (j && typeof j.final === "string") final = j.final.trim();
-    } catch { /* swallow */ }
+    } catch { /* ignore and continue */ }
     await dbg("gpt5_reply", {
       attempt: "jsonfmt", model: r?.model, usage: r?.usage,
       len: (final||"").length, types: summariseContentTypes(r),
@@ -168,7 +165,7 @@ export async function gpt5Reply(userMsg) {
     await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
   }
 
-  // --- Attempt 2: normal text via items + <final> contract (no tools)
+  // Attempt 2 — items + <final> contract (plain text, no tools)
   const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
@@ -193,7 +190,7 @@ export async function gpt5Reply(userMsg) {
     await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // --- Attempt 3: plain string input + <final> contract (no tools)
+  // Attempt 3 — plain string + <final> (no tools)
   const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
