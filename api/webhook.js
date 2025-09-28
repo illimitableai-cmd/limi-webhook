@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini in Vercel to use mini
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini to use mini
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -89,10 +89,10 @@ async function gpt5Reply(userMsg) {
     max_output_tokens: 220
   };
 
-  // Attempt A: Use object form for text.format (some snapshots require this)
+  // Attempt A: Use text.format = "text" (supported values: text | json_object | json_schema)
   const paramsA = {
     ...BASE,
-    text: { format: { type: "plain_text" } }, // <-- object form
+    text: { format: "text" }, // <-- latest valid value per your snapshot
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
 
@@ -105,7 +105,7 @@ async function gpt5Reply(userMsg) {
     const m = String(r.__error?.message || r.__error);
     await dbg("gpt5_error", { attempt: "A", message: m });
 
-    // If the snapshot rejects 'text' or 'text.format', fall back without 'text'
+    // If the snapshot rejects 'text' or its format, fall back without 'text'
     if (/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(m)) {
       const paramsB = {
         ...BASE,
