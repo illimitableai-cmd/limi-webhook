@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // <-- full GPT-5 rolling release
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // full GPT-5 (rolling)
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -55,23 +55,29 @@ function collapseResponsesText(resp) {
   if (!resp) return "";
   if (typeof resp.output_text === "string" && resp.output_text) return resp.output_text;
   try {
-    const chunks = [];
+    const out = [];
     for (const item of resp.output || []) {
       for (const c of item?.content || []) {
-        if (typeof c?.text === "string") chunks.push(c.text);
-        else if (typeof c?.output_text === "string") chunks.push(c.output_text);
+        if (typeof c?.text === "string") out.push(c.text);
+        else if (typeof c?.output_text === "string") out.push(c.output_text);
       }
     }
-    return chunks.join("");
+    return out.join("");
   } catch { return ""; }
 }
 
 /* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
 export async function gpt5Reply(userMsg) {
+  function extractFinalBlock(s="") {
+    const m = s.match(/<final>([\s\S]*?)<\/final>/i);
+    return m ? m[1].trim() : "";
+  }
   async function callWithTimeout(params, timeoutMs, dbgLabel) {
     await dbg(dbgLabel + "_request", {
       model: params.model,
-      input_preview: userMsg.slice(0,160)
+      input_preview: typeof params.input === "string"
+        ? params.input.slice(0,160)
+        : (JSON.stringify(params.input)?.slice(0,160) || "")
     });
     const p = openai.responses.create(params);
     return new Promise((resolve) => {
@@ -80,31 +86,55 @@ export async function gpt5Reply(userMsg) {
        .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
     });
   }
+  function getVisibleText(resp) {
+    const raw = (collapseResponsesText(resp) || "").trim();
+    const finalOnly = extractFinalBlock(raw);
+    return (finalOnly || raw).trim();
+  }
 
-  const params = {
+  // Shared knobs
+  const INSTRUCTIONS =
+    "Answer the user directly and clearly in 1–4 sentences. " +
+    "Put ONLY your final answer between <final> and </final>. No reasoning text, no preamble.";
+
+  // Attempt 1: items with input_text (most compatible)
+  const params1 = {
     model: CHAT_MODEL,
-    max_output_tokens: 300, // <-- increased for longer replies
-    instructions:
-      "Answer the user directly and clearly in 1–4 sentences. " +
-      "Put ONLY your final answer between <final> and </final>. No reasoning text.",
+    max_output_tokens: 300, // longer replies
+    instructions: INSTRUCTIONS,
     input: [
       { role: "user", content: [{ type: "input_text", text: userMsg }] }
-    ],
-    output: [
-      { role: "assistant", content: [{ type: "output_text" }] }
     ]
   };
 
-  const r = await callWithTimeout(params, LLM_TIMEOUT_MS, "gpt5");
-  if (r?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS }); return "Sorry—took too long to respond."; }
-  if (r?.__error)   { await dbg("gpt5_error", { message: String(r.__error?.message || r.__error) }); return "Model error: " + String(r.__error?.message || r.__error); }
+  const r1 = await callWithTimeout(params1, LLM_TIMEOUT_MS, "gpt5A");
+  if (r1?.__timeout) { await dbg("gpt5_timeout", { attempt: "A", ms: LLM_TIMEOUT_MS }); return "Sorry—took too long to respond."; }
+  if (r1?.__error)   { await dbg("gpt5_error", { attempt: "A", message: String(r1.__error?.message || r1.__error) }); }
+  else {
+    const text1 = getVisibleText(r1);
+    await dbg("gpt5_reply", { model: r1?.model, usage: r1?.usage, len: text1.length, preview: text1.slice(0,160) });
+    if (text1) return text1;
+  }
 
-  let text = (collapseResponsesText(r) || "").trim();
-  const m = text.match(/<final>([\s\S]*?)<\/final>/i);
-  if (m) text = m[1].trim();
+  // Attempt 2: plain string input (some snapshots prefer this minimal shape)
+  const params2 = {
+    model: CHAT_MODEL,
+    max_output_tokens: 300,
+    instructions: INSTRUCTIONS,
+    input: `User: ${userMsg}\n\n<final>`
+  };
 
-  await dbg("gpt5_reply", { model: r?.model, usage: r?.usage, len: text.length, preview: text.slice(0,160) });
-  return text || "I’ll keep it brief: I couldn’t generate a response.";
+  const r2 = await callWithTimeout(params2, Math.max(3000, Math.floor(LLM_TIMEOUT_MS/2)), "gpt5S");
+  if (r2?.__timeout) { await dbg("gpt5_timeout_retry", { attempt: "S" }); return "Sorry—took too long to respond."; }
+  if (r2?.__error)   { await dbg("gpt5_error_retry", { attempt: "S", message: String(r2.__error?.message || r2.__error) }); }
+  else {
+    const text2 = getVisibleText(r2);
+    await dbg("gpt5_reply_retry", { model: r2?.model, usage: r2?.usage, len: text2.length, preview: text2.slice(0,160) });
+    if (text2) return text2;
+  }
+
+  await dbg("gpt5_empty_after_retry", { model: CHAT_MODEL });
+  return "I’ll keep it brief: I couldn’t generate a response.";
 }
 
 /* ---------------- Twilio send (WA direct) ---------------- */
@@ -149,6 +179,7 @@ export default async function handler(req, res) {
       return;
     }
 
+    // SMS photo guard (UK)
     if (!isWhatsApp && NumMedia > 0) {
       res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
