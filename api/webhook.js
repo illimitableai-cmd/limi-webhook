@@ -53,213 +53,172 @@ function smsNumber(s="") {
 }
 
 /* ---------------- Deep extraction helpers ---------------- */
-// Safely stringify a small slice for logs
-function safeSlice(obj, n = 800) {
+function safeSlice(obj, n = 1000) {
   try { return JSON.stringify(obj).slice(0, n); } catch { return String(obj).slice(0, n); }
 }
-
-// Find the first JSON object in the output (content blocks often carry it under .json)
 function deepFindJson(resp) {
   let found = null;
   const visit = (node) => {
     if (!node || typeof node !== "object" || found) return;
-    // explicit json field
     if (node.json && typeof node.json === "object") { found = node.json; return; }
-    // blocks whose type hints JSON
     if (typeof node.type === "string" && /json/i.test(node.type)) {
       if (node.json && typeof node.json === "object") { found = node.json; return; }
-      // sometimes the JSON lives in "text" as a string
-      if (typeof node.text === "string") {
-        try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {}
-      }
+      if (typeof node.text === "string") { try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {} }
     }
-    // generic leaf parse
     if (typeof node.text === "string" && node.text.trim().startsWith("{")) {
       try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {}
     }
     if (Array.isArray(node)) { for (const it of node) visit(it); return; }
     for (const k of Object.keys(node)) visit(node[k]);
   };
-  if (resp?.output) visit(resp.output);
-  else visit(resp);
+  if (resp?.output) visit(resp.output); else visit(resp);
   return found;
 }
-
-// Collect visible text from any known shapes
 function deepFindText(resp) {
   const out = [];
   const visit = (node) => {
     if (!node || typeof node !== "object") return;
-
-    // common leaves
     if (typeof node.output_text === "string" && node.output_text) out.push(node.output_text);
     if (typeof node.text === "string" && node.text) out.push(node.text);
-
-    // sometimes text is wrapped: { text: { value: "..." } }
-    if (node.text && typeof node.text === "object" && typeof node.text.value === "string") {
-      out.push(node.text.value);
-    }
-
-    // JSON object containing final
-    if (node.json && typeof node.json === "object" && typeof node.json.final === "string") {
-      out.push(node.json.final);
-    }
-
-    // Walk arrays and nested shapes
+    if (node.text && typeof node.text === "object" && typeof node.text.value === "string") out.push(node.text.value);
+    if (node.json && typeof node.json === "object" && typeof node.json.final === "string") out.push(node.json.final);
     if (Array.isArray(node)) { for (const it of node) visit(it); return; }
     if (Array.isArray(node.content)) { for (const it of node.content) visit(it); }
     if (node.assistant_response && typeof node.assistant_response === "object") visit(node.assistant_response);
-
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (v && typeof v === "object") visit(v);
-    }
+    for (const k of Object.keys(node)) { const v = node[k]; if (v && typeof v === "object") visit(v); }
   };
-
-  if (Array.isArray(resp?.output)) visit(resp.output);
-  else visit(resp);
+  if (Array.isArray(resp?.output)) visit(resp.output); else visit(resp);
   return out.join("").trim();
 }
-
 function extractFinalTag(s="") {
   const m = s.match(/<final>([\s\S]*?)<\/final>/i);
   return m ? m[1].trim() : "";
 }
 
-/* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
+/* ---------------- OpenAI (GPT-5) ---------------- */
 export async function gpt5Reply(userMsg) {
   const INSTRUCTIONS =
     "Return ONLY the final answer. Be direct and clear in 1–4 sentences. " +
     "Wrap the final answer like this: <final>...your answer...</final>.";
 
-  async function callWithTimeout(params, dbgLabel) {
-    await dbg(dbgLabel + "_request", {
-      model: params.model,
-      input_preview:
-        typeof params.input === "string"
-          ? params.input.slice(0,160)
-          : (JSON.stringify(params.input || "").slice(0,160))
-    });
-    const p = openai.responses.create(params);
+  async function callWithTimeout(promise, label, reqPreview) {
+    await dbg(label + "_request", reqPreview);
     return new Promise((resolve) => {
       const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-      p.then((r) => { clearTimeout(t); resolve(r); })
-       .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+      promise.then((r) => { clearTimeout(t); resolve(r); })
+             .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
     });
   }
 
-  // --- Attempt 1: JSON via text.format (requires the word "json/JSON" in input)
-  const paramsJson = {
+  // --- Attempt 1: Responses JSON using text.format + “JSON” in input
+  const req1 = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
     text: { format: { type: "json_object" } },
+    // Some GPT-5 variants only emit reasoning unless you ask for text; "modalities" helps where supported.
+    modalities: ["text"],
     instructions: "You are an SMS assistant. Output JSON only.",
     input: [
-      {
-        role: "system",
-        content: [
-          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." }
-        ]
-      },
+      { role: "system", content: [{ type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." }]},
       { role: "user", content: [{ type: "input_text", text: userMsg }]}
-    ],
+    ]
   };
-
-  let r = await callWithTimeout(paramsJson, "gpt5_jsonfmt");
+  let r = await callWithTimeout(openai.responses.create(req1), "gpt5_jsonfmt", {
+    model: req1.model,
+    input_preview: safeSlice(req1.input, 200)
+  });
   if (r?.__timeout) {
     await dbg("gpt5_timeout", { attempt: "jsonfmt", ms: LLM_TIMEOUT_MS });
-    return "Sorry—took too long to respond.";
-  }
-  if (!r?.__error) {
-    // extra debug: log the first output item structure
+  } else if (!r?.__error) {
     const output0 = Array.isArray(r.output) ? r.output[0] : null;
-    await dbg("gpt5_jsonfmt_shape", {
-      output0_shape: safeSlice(output0, 1000),
-      output0_keys: output0 ? Object.keys(output0) : []
-    });
-
-    // Prefer JSON blocks
+    await dbg("gpt5_jsonfmt_shape", { output0_keys: output0 ? Object.keys(output0) : [], output0_shape: safeSlice(output0) });
     const j = deepFindJson(r);
     if (j && typeof j.final === "string" && j.final.trim()) {
       const final = j.final.trim();
-      await dbg("gpt5_reply", {
-        attempt: "jsonfmt", model: r?.model, usage: r?.usage,
-        len: final.length
-      });
+      await dbg("gpt5_reply", { attempt: "jsonfmt", len: final.length, model: r?.model, usage: r?.usage });
       return final;
     }
-
-    // Fallback: any visible text we can find
-    const all = deepFindText(r);
-    if (all) {
-      await dbg("gpt5_reply", {
-        attempt: "jsonfmt_textfallback", model: r?.model, usage: r?.usage,
-        len: all.length
-      });
-      return all;
+    const text = deepFindText(r);
+    if (text) {
+      await dbg("gpt5_reply", { attempt: "jsonfmt_text", len: text.length, model: r?.model, usage: r?.usage });
+      return text;
     }
   } else {
     await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
   }
 
-  // --- Attempt 2: items + <final> (plain text)
-  const paramsItems = {
+  // --- Attempt 2: Responses plain text with <final>
+  const req2 = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
+    modalities: ["text"],
     instructions: INSTRUCTIONS,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
-  r = await callWithTimeout(paramsItems, "gpt5_items");
+  r = await callWithTimeout(openai.responses.create(req2), "gpt5_items", {
+    model: req2.model,
+    input_preview: safeSlice(req2.input, 200)
+  });
   if (r?.__timeout) {
     await dbg("gpt5_timeout", { attempt: "items", ms: LLM_TIMEOUT_MS });
-    return "Sorry—took too long to respond.";
-  }
-  if (!r?.__error) {
+  } else if (!r?.__error) {
     const output0 = Array.isArray(r.output) ? r.output[0] : null;
-    await dbg("gpt5_items_shape", {
-      output0_shape: safeSlice(output0, 1000),
-      output0_keys: output0 ? Object.keys(output0) : []
-    });
-
-    let text = deepFindText(r);
+    await dbg("gpt5_items_shape", { output0_keys: output0 ? Object.keys(output0) : [], output0_shape: safeSlice(output0) });
+    const text = deepFindText(r);
     const final = extractFinalTag(text) || text;
-    await dbg("gpt5_reply", {
-      attempt: "items", model: r?.model, usage: r?.usage,
-      len: (final||"").length
-    });
-    if (final) return final;
+    if (final) {
+      await dbg("gpt5_reply", { attempt: "items", len: final.length, model: r?.model, usage: r?.usage });
+      return final;
+    }
   } else {
     await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // --- Attempt 3: plain string + <final> (no tools)
-  const paramsString = {
+  // --- Attempt 3: Responses minimal string with <final>
+  const req3 = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
+    modalities: ["text"],
     instructions: INSTRUCTIONS,
-    input: `User: ${userMsg}\n\n<final>`,
+    input: `User: ${userMsg}\n\n<final>`
   };
-  r = await callWithTimeout(paramsString, "gpt5_string");
+  r = await callWithTimeout(openai.responses.create(req3), "gpt5_string", {
+    model: req3.model,
+    input_preview: safeSlice(req3.input, 200)
+  });
   if (r?.__timeout) {
     await dbg("gpt5_timeout_retry", { attempt: "string" });
-    return "Sorry—took too long to respond.";
-  }
-  if (!r?.__error) {
+  } else if (!r?.__error) {
     const output0 = Array.isArray(r.output) ? r.output[0] : null;
-    await dbg("gpt5_string_shape", {
-      output0_shape: safeSlice(output0, 1000),
-      output0_keys: output0 ? Object.keys(output0) : []
-    });
-
-    let text = deepFindText(r);
+    await dbg("gpt5_string_shape", { output0_keys: output0 ? Object.keys(output0) : [], output0_shape: safeSlice(output0) });
+    const text = deepFindText(r);
     const final = extractFinalTag(text) || text;
-    await dbg("gpt5_reply_retry", {
-      attempt: "string", model: r?.model, usage: r?.usage,
-      len: (final||"").length
-    });
-    if (final) return final;
+    if (final) {
+      await dbg("gpt5_reply_retry", { attempt: "string", len: final.length, model: r?.model, usage: r?.usage });
+      return final;
+    }
   } else {
     await dbg("gpt5_error_retry", { attempt: "string", message: String(r.__error?.message || r.__error) });
+  }
+
+  // --- Attempt 4: Chat Completions fallback (ALWAYS returns visible text)
+  try {
+    const req4 = {
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: "You are a concise SMS assistant. Reply in 1–4 sentences." },
+        { role: "user", content: userMsg }
+      ],
+      max_completion_tokens: 300,
+      temperature: 0.3
+    };
+    await dbg("gpt5_chat_request", { model: req4.model, input_preview: safeSlice(req4.messages, 200) });
+    const ch = await openai.chat.completions.create(req4);
+    const content = ch?.choices?.[0]?.message?.content?.trim();
+    await dbg("gpt5_chat_reply", { has_content: !!content, finish_reason: ch?.choices?.[0]?.finish_reason, usage: ch?.usage });
+    if (content) return content;
+  } catch (e) {
+    await dbg("gpt5_chat_error", { message: String(e?.message || e) });
   }
 
   await dbg("gpt5_empty_after_retry", { model: CHAT_MODEL });
