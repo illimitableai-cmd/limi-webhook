@@ -66,14 +66,20 @@ function collapseResponsesText(resp) {
   } catch { return ""; }
 }
 
-/* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
+
 async function gpt5Reply(userMsg) {
-  // Helper: call OpenAI with timeout + debug
+  // --- Helpers ---
+  function extractBetweenDelims(s) {
+    if (!s) return "";
+    const m = s.match(/<final>([\s\S]*?)<\/final>/i);
+    return m ? m[1].trim() : "";
+  }
   async function callWithTimeout(params, timeoutMs, dbgLabel) {
     await dbg(dbgLabel + "_request", {
       model: params.model,
       input_preview: userMsg.slice(0,160),
-      has_text_param: !!params.text
+      has_text_param: !!params.text,
+      has_reasoning: !!params.reasoning
     });
     const p = openai.responses.create(params);
     return new Promise((resolve) => {
@@ -82,78 +88,104 @@ async function gpt5Reply(userMsg) {
        .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
     });
   }
+  function collapse(resp) {
+    let text = collapseResponsesText(resp).trim();
+    // If model printed the delimiters inside the text, extract just the final section
+    const extracted = extractBetweenDelims(text);
+    return extracted || text;
+  }
 
   const BASE = {
     model: CHAT_MODEL,
-    instructions: "You are a concise assistant. Always produce a short, direct text answer.",
     max_output_tokens: 220
   };
 
-  // Attempt A: Use text.format = "text" (supported values: text | json_object | json_schema)
+  // --- Attempt A: text.format = "text" (newer snapshots)
   const paramsA = {
     ...BASE,
-    text: { format: "text" }, // <-- latest valid value per your snapshot
-    input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
+    instructions:
+      "You are a concise assistant. Answer clearly in plain text.",
+    text: { format: "text" },
+    input: [
+      { role: "user", content: [{ type: "input_text", text: userMsg }] }
+    ],
   };
 
   let r = await callWithTimeout(paramsA, LLM_TIMEOUT_MS, "gpt5A");
-  if (r?.__timeout) {
-    await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS, attempt: "A" });
-    return "Sorry—took too long to respond.";
-  }
+  if (r?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS, attempt: "A" }); return "Sorry—took too long to respond."; }
   if (r?.__error) {
     const m = String(r.__error?.message || r.__error);
     await dbg("gpt5_error", { attempt: "A", message: m });
-
-    // If the snapshot rejects 'text' or its format, fall back without 'text'
-    if (/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(m)) {
-      const paramsB = {
-        ...BASE,
-        input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
-      };
-      r = await callWithTimeout(paramsB, LLM_TIMEOUT_MS, "gpt5B");
-      if (r?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS, attempt: "B" }); return "Sorry—took too long to respond."; }
-      if (r?.__error)   { const mb = String(r.__error?.message || r.__error); await dbg("gpt5_error", { attempt: "B", message: mb }); return `Model error: ${mb}`; }
-    } else {
+    // If the snapshot dislikes 'text' or its format, drop it entirely
+    if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(m)) {
       return `Model error: ${m}`;
     }
+  } else {
+    const textA = collapse(r);
+    await dbg("gpt5_reply", {
+      model: r?.model || CHAT_MODEL,
+      usage: r?.usage || null,
+      len: textA.length,
+      preview: textA.slice(0,160)
+    });
+    if (textA) return textA;
   }
 
-  // Success path (A or B)
-  let text = collapseResponsesText(r).trim();
-  await dbg("gpt5_reply", {
-    model: r?.model || CHAT_MODEL,
-    usage: r?.usage || null,
-    len: text.length,
-    preview: text.slice(0,160)
-  });
-  if (text) return text;
-
-  // Retry C: stricter instruction, no 'text' param (max compatibility)
-  await dbg("gpt5_retry", { reason: "empty_text_first_attempt" });
-  const paramsC = {
+  // --- Attempt B: No 'text' param; force a visible final answer with delimiters
+  // We give the model a finishing rule it tends to obey:
+  // "Put ONLY your final answer between <final>...</final>."
+  const paramsB = {
     ...BASE,
-    instructions: "Answer the user's question directly in 1–2 short sentences. Plain text only.",
+    instructions:
+      "Answer the user directly in one or two short sentences. " +
+      "Put ONLY your final answer between <final> and </final>. Do not include any other text.",
     input: [
-      { role: "system", content: [{ type: "input_text", text: "Return a direct answer as plain text." }]},
+      { role: "system", content: [{ type: "input_text", text: "Return the final answer between <final> and </final>. No preamble." }]},
       { role: "user",   content: [{ type: "input_text", text: userMsg }]},
     ],
   };
+
+  r = await callWithTimeout(paramsB, LLM_TIMEOUT_MS, "gpt5B");
+  if (r?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS, attempt: "B" }); return "Sorry—took too long to respond."; }
+  if (r?.__error)   { const mb = String(r.__error?.message || r.__error); await dbg("gpt5_error", { attempt: "B", message: mb }); return `Model error: ${mb}`; }
+
+  let textB = collapse(r);
+  await dbg("gpt5_reply", {
+    model: r?.model || CHAT_MODEL,
+    usage: r?.usage || null,
+    len: textB.length,
+    preview: textB.slice(0,160)
+  });
+  if (textB) return textB;
+
+  // --- Attempt C: Nudge with an explicit finalization turn
+  const paramsC = {
+    ...BASE,
+    instructions:
+      "Provide ONLY the final answer between <final> and </final>.",
+    input: [
+      { role: "user",      content: [{ type: "input_text", text: userMsg }]},
+      { role: "assistant", content: [{ type: "input_text", text: "Thinking..." }]},
+      { role: "system",    content: [{ type: "input_text", text: "Now output ONLY the final answer between <final> and </final>." }]},
+    ],
+  };
+
   const r2 = await callWithTimeout(paramsC, Math.max(3000, Math.floor(LLM_TIMEOUT_MS/2)), "gpt5C");
   if (r2?.__timeout) { await dbg("gpt5_timeout_retry", {}); return "Sorry—took too long to respond."; }
-  if (r2?.__error)   { const m2 = String(r2.__error?.message || r2.__error); await dbg("gpt5_error_retry", { message: m2 }); return `Model error: ${m2}`; }
+  if (r2?.__error)   { const mc = String(r2.__error?.message || r2.__error); await dbg("gpt5_error_retry", { message: mc }); return `Model error: ${mc}`; }
 
-  text = collapseResponsesText(r2).trim();
+  const textC = collapse(r2);
   await dbg("gpt5_reply_retry", {
     model: r2?.model || CHAT_MODEL,
     usage: r2?.usage || null,
-    len: text.length,
-    preview: text.slice(0,160)
+    len: textC.length,
+    preview: textC.slice(0,160)
   });
 
-  if (!text) await dbg("gpt5_empty_after_retry", { model: r2?.model || CHAT_MODEL });
-  return text || "I’ll keep it brief: I couldn’t generate a response.";
+  if (!textC) await dbg("gpt5_empty_after_retry", { model: r2?.model || CHAT_MODEL });
+  return textC || "I’ll keep it brief: I couldn’t generate a response.";
 }
+
 
 /* ---------------- Twilio send (WA direct) ---------------- */
 async function sendWhatsApp(to, body) {
