@@ -9,7 +9,7 @@ import { createClient } from "@supabase/supabase-js";
  * Required: OPENAI_KEY, TWILIO_SID, TWILIO_AUTH, TWILIO_FROM
  * Optional: TWILIO_WHATSAPP_FROM (format: whatsapp:+447...)
  * Optional: OPENAI_CHAT_MODEL (default: gpt-5-nano), LLM_TIMEOUT_MS
- * For debug logs: SUPABASE_URL, SUPABASE_KEY and table `debug_logs`
+ * For debug logs: SUPABASE_URL, SUPABASE_KEY and a table `debug_logs`
  */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini in Vercel to use mini
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini to use mini
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -71,7 +71,7 @@ async function gpt5Reply(userMsg) {
   const baseParams = {
     model: CHAT_MODEL,
     instructions: "You are a concise assistant. Always produce a short, direct text answer. Output text only.",
-    modalities: ["text"],
+    response_format: { type: "text" }, // prefer text output
     max_output_tokens: 220
   };
 
@@ -102,10 +102,10 @@ async function gpt5Reply(userMsg) {
   });
   if (text) return text;
 
-  // Retry once with stricter system hint
+  // Retry once with stricter prompt
   const params2 = {
     ...baseParams,
-    instructions: "Answer the user's question directly in 1–2 short sentences. Output TEXT ONLY.",
+    instructions: "Answer the user's question directly in 1–2 short sentences. Return PLAIN TEXT only.",
     input: [
       { role: "system", content: [{ type: "input_text", text: "Return a direct answer as plain text." }]},
       { role: "user",   content: [{ type: "input_text", text: userMsg }]},
@@ -132,10 +132,7 @@ async function gpt5Reply(userMsg) {
     preview: text.slice(0,160)
   });
 
-  if (!text) {
-    // fail-fast log so we can see it clearly
-    await dbg("gpt5_empty_after_retry", { model: r2?.model || CHAT_MODEL });
-  }
+  if (!text) await dbg("gpt5_empty_after_retry", { model: r2?.model || CHAT_MODEL });
   return text || "I’ll keep it brief: I couldn’t generate a response.";
 }
 
