@@ -8,7 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 /** --- ENV ---
  * Required: OPENAI_KEY, TWILIO_SID, TWILIO_AUTH, TWILIO_FROM
  * Optional: TWILIO_WHATSAPP_FROM (format: whatsapp:+447...)
- * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS, SMS_MAX_CHARS, CHAT_MAX_TOKENS
+ * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS, SMS_MAX_CHARS, CHAT_MAX_TOKENS, CHAT_RETRY_TOKENS
  * For debug logs: SUPABASE_URL, SUPABASE_KEY and a table `debug_logs`
  */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
@@ -24,6 +24,7 @@ const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 const MAX_SMS_CHARS = Number(process.env.SMS_MAX_CHARS || 320);
 const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);
+const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 800);
 
 /* ---------------- Debug logging ---------------- */
 async function dbg(step, payload) {
@@ -68,7 +69,7 @@ function deepFindJson(resp) {
     if (node.json && typeof node.json === "object") { found = node.json; return; }
     if (typeof node.type === "string" && /json/i.test(node.type)) {
       if (node.json && typeof node.json === "object") { found = node.json; return; }
-      if (typeof node.text === "string") { try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {} }
+      if (typeof node.text === "string") { try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {}
     }
     if (typeof node.text === "string" && node.text.trim().startsWith("{")) {
       try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {}
@@ -115,28 +116,48 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // --- Attempt A: Chat Completions first (reliable visible text)
-  const chatReq = {
-    model: CHAT_MODEL,
-    messages: [
-      { role: "system", content: "You are a concise SMS assistant for Limi. Reply in 1–2 short sentences. No preamble, no bullets, no markdown. Keep it friendly and direct." },
-      { role: "user", content: userMsg }
-    ],
-    // model complained about non-default temperature earlier; omit it
-    max_completion_tokens: MAX_COMPLETION_TOKENS
-  };
-  let r = await withTimeout(openai.chat.completions.create(chatReq), "gpt5_chat", {
-    model: chatReq.model,
-    input_preview: safeSlice(chatReq.messages, 200)
-  });
-  if (r?.__timeout) {
-    await dbg("gpt5_chat_error", { message: "timeout" });
-  } else if (!r?.__error) {
-    const content = r?.choices?.[0]?.message?.content?.trim();
-    await dbg("gpt5_chat_reply", { has_content: !!content, usage: r?.usage, finish_reason: r?.choices?.[0]?.finish_reason });
-    if (content) return content;
-  } else {
-    await dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error) });
+  // helper: one chat call with a chosen token cap
+  async function chatOnce(maxTokens) {
+    const chatReq = {
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: "You are a concise SMS assistant for Limi. Reply in 1–2 short sentences. No preamble, no bullets, no markdown. Keep it friendly and direct." },
+        { role: "user", content: userMsg }
+      ],
+      max_completion_tokens: maxTokens
+    };
+    const r = await withTimeout(
+      openai.chat.completions.create(chatReq),
+      "gpt5_chat",
+      { model: chatReq.model, input_preview: safeSlice(chatReq.messages, 200), maxTokens }
+    );
+    if (r?.__timeout) {
+      await dbg("gpt5_chat_error", { message: "timeout", maxTokens });
+      return null;
+    }
+    if (r?.__error) {
+      await dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error), maxTokens });
+      return null;
+    }
+    const choice = r?.choices?.[0];
+    const content = choice?.message?.content?.trim() || "";
+    await dbg("gpt5_chat_reply", {
+      has_content: !!content,
+      finish_reason: choice?.finish_reason,
+      usage: r?.usage,
+      maxTokens
+    });
+    return { content, finish_reason: choice?.finish_reason, usage: r?.usage };
+  }
+
+  // --- Attempt A: Chat Completions (short cap)
+  let cr = await chatOnce(MAX_COMPLETION_TOKENS);
+  if (cr?.content) return cr.content;
+
+  // If the model hit the cap (finish_reason: "length") or produced no content (reasoning ate the budget), retry with a bigger cap
+  if (!cr || cr.finish_reason === "length") {
+    cr = await chatOnce(CHAT_RETRY_TOKENS);
+    if (cr?.content) return cr.content;
   }
 
   // --- Attempt B: Responses plain text with <final>
@@ -146,7 +167,7 @@ export async function gpt5Reply(userMsg) {
     instructions: INSTRUCTIONS,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}]
   };
-  r = await withTimeout(openai.responses.create(req2), "gpt5_items", {
+  let r = await withTimeout(openai.responses.create(req2), "gpt5_items", {
     model: req2.model,
     input_preview: safeSlice(req2.input, 200)
   });
