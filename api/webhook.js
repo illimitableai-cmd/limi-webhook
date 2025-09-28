@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set OPENAI_CHAT_MODEL=gpt-5-mini in Vercel to use mini
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini in Vercel to use mini
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -68,61 +68,80 @@ function collapseResponsesText(resp) {
 
 /* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
 async function gpt5Reply(userMsg) {
-  const baseParams = {
+  // Helper: call OpenAI with timeout + debug
+  async function callWithTimeout(params, timeoutMs, dbgLabel) {
+    await dbg(dbgLabel + "_request", {
+      model: params.model,
+      input_preview: userMsg.slice(0,160),
+      has_text_param: !!params.text
+    });
+    const p = openai.responses.create(params);
+    return new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ __timeout: true }), timeoutMs);
+      p.then((r) => { clearTimeout(t); resolve(r); })
+       .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+    });
+  }
+
+  const BASE = {
     model: CHAT_MODEL,
     instructions: "You are a concise assistant. Always produce a short, direct text answer.",
-    text: { format: "plain" }, // ✅ correct parameter
     max_output_tokens: 220
   };
 
-  // First attempt
-  const params1 = {
-    ...baseParams,
+  // Attempt A: Use object form for text.format (some snapshots require this)
+  const paramsA = {
+    ...BASE,
+    text: { format: { type: "plain_text" } }, // <-- object form
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
 
-  await dbg("gpt5_request", { model: CHAT_MODEL, input_preview: userMsg.slice(0,160) });
+  let r = await callWithTimeout(paramsA, LLM_TIMEOUT_MS, "gpt5A");
+  if (r?.__timeout) {
+    await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS, attempt: "A" });
+    return "Sorry—took too long to respond.";
+  }
+  if (r?.__error) {
+    const m = String(r.__error?.message || r.__error);
+    await dbg("gpt5_error", { attempt: "A", message: m });
 
-  const p1 = openai.responses.create(params1);
-  const r1 = await new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-    p1.then((r) => { clearTimeout(t); resolve(r); })
-      .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
-  });
+    // If the snapshot rejects 'text' or 'text.format', fall back without 'text'
+    if (/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(m)) {
+      const paramsB = {
+        ...BASE,
+        input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
+      };
+      r = await callWithTimeout(paramsB, LLM_TIMEOUT_MS, "gpt5B");
+      if (r?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS, attempt: "B" }); return "Sorry—took too long to respond."; }
+      if (r?.__error)   { const mb = String(r.__error?.message || r.__error); await dbg("gpt5_error", { attempt: "B", message: mb }); return `Model error: ${mb}`; }
+    } else {
+      return `Model error: ${m}`;
+    }
+  }
 
-  if (r1?.__timeout) { await dbg("gpt5_timeout", { ms: LLM_TIMEOUT_MS }); return "Sorry—took too long to respond."; }
-  if (r1?.__error)   { const m = String(r1.__error?.message || r1.__error); await dbg("gpt5_error", { message: m }); return `Model error: ${m}`; }
-
-  let text = collapseResponsesText(r1).trim();
+  // Success path (A or B)
+  let text = collapseResponsesText(r).trim();
   await dbg("gpt5_reply", {
-    model: r1?.model || CHAT_MODEL,
-    usage: r1?.usage || null,
+    model: r?.model || CHAT_MODEL,
+    usage: r?.usage || null,
     len: text.length,
     preview: text.slice(0,160)
   });
   if (text) return text;
 
-  // Retry once with stricter prompt
-  const params2 = {
-    ...baseParams,
+  // Retry C: stricter instruction, no 'text' param (max compatibility)
+  await dbg("gpt5_retry", { reason: "empty_text_first_attempt" });
+  const paramsC = {
+    ...BASE,
     instructions: "Answer the user's question directly in 1–2 short sentences. Plain text only.",
     input: [
       { role: "system", content: [{ type: "input_text", text: "Return a direct answer as plain text." }]},
       { role: "user",   content: [{ type: "input_text", text: userMsg }]},
     ],
   };
-
-  await dbg("gpt5_retry", { reason: "empty_text_first_attempt" });
-
-  const p2 = openai.responses.create(params2);
-  const r2 = await new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ __timeout: true }), Math.max(3000, Math.floor(LLM_TIMEOUT_MS/2)));
-    p2.then((r) => { clearTimeout(t); resolve(r); })
-      .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
-  });
-
+  const r2 = await callWithTimeout(paramsC, Math.max(3000, Math.floor(LLM_TIMEOUT_MS/2)), "gpt5C");
   if (r2?.__timeout) { await dbg("gpt5_timeout_retry", {}); return "Sorry—took too long to respond."; }
-  if (r2?.__error)   { const m = String(r2.__error?.message || r2.__error); await dbg("gpt5_error_retry", { message: m }); return `Model error: ${m}`; }
+  if (r2?.__error)   { const m2 = String(r2.__error?.message || r2.__error); await dbg("gpt5_error_retry", { message: m2 }); return `Model error: ${m2}`; }
 
   text = collapseResponsesText(r2).trim();
   await dbg("gpt5_reply_retry", {
