@@ -63,16 +63,23 @@ async function dbg(step, payload, userId = null) {
 // ---------- Responses API helpers (for GPT-5) ----------
 function mapMsgForResponses(m) {
   const toText = (x) => (typeof x === "string" ? x : (x?.text ?? JSON.stringify(x)));
-  if (Array.isArray(m.content)) {
-    const parts = m.content.map((p) => {
-      if (p?.type === "image_url" && p?.image_url?.url) {
-        return { type: "input_image", image_url: p.image_url.url };
-      }
-      return { type: "input_text", text: toText(p) };
-    });
-    return { role: m.role, content: parts };
-  }
-  return { role: m.role, content: [{ type: "input_text", text: String(m.content ?? "") }] };
+
+  // Normalise to array-of-parts shape used by Responses API
+  const arr = Array.isArray(m.content)
+    ? m.content
+    : [{ type: "text", text: toText(m.content) }];
+
+  const parts = arr.map((p) => {
+    // Images: allow both { image_url: "..." } and { image_url: { url: "..." } }
+    if (p?.type === "image_url" && p?.image_url) {
+      const url = typeof p.image_url === "string" ? p.image_url : p.image_url.url;
+      return { type: "input_image", image_url: url };
+    }
+    // TEXT PARTS MUST BE type: "text" for Responses API
+    return { type: "text", text: toText(p) };
+  });
+
+  return { role: m.role, content: parts };
 }
 function collapseResponsesText(resp) {
   if (resp?.output_text) return String(resp.output_text);
