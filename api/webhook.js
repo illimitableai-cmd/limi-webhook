@@ -22,13 +22,14 @@ const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
 // ===== Models
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-mini";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
+// Kept but unused by design (strict GPT-5 only)
 const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-mini-2025-08-07";
 
 // ===== Feature flags
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
-const STRICT_GPT5       = process.env.STRICT_GPT5 !== "0";
+const STRICT_GPT5       = process.env.STRICT_GPT5 !== "0"; // not used; behavior is always strict
 
 // FREE TRIAL
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
@@ -76,16 +77,13 @@ function collapseResponsesText(resp) {
   } catch { return ""; }
 }
 
-// Build a message compatible with Responses API, parameterised by the input type.
-// Some accounts/SDKs still expect {type:"text"} instead of {type:"input_text"}.
-function mapMsgForResponses(m, useInputText = true) {
-  const INPUT_TEXT = useInputText ? "input_text" : "text";
-
+// Always build Responses API messages using input_text / input_image (strict).
+function mapMsgForResponses(m) {
   const toText = (x) => (typeof x === "string" ? x : (x?.text ?? JSON.stringify(x)));
 
   const partsIn = Array.isArray(m.content)
     ? m.content
-    : [{ type: INPUT_TEXT, text: toText(m.content) }];
+    : [{ type: "input_text", text: toText(m.content) }];
 
   const partsOut = partsIn.map((p) => {
     if (p?.type === "image_url" && p?.image_url) {
@@ -93,7 +91,7 @@ function mapMsgForResponses(m, useInputText = true) {
       return { type: "input_image", image_url: url };
     }
     const txt = typeof p === "string" ? p : (p.text ?? p.content ?? toText(p));
-    return { type: INPUT_TEXT, text: String(txt ?? "") };
+    return { type: "input_text", text: String(txt ?? "") };
   });
 
   return { role: m.role, content: partsOut };
@@ -110,119 +108,43 @@ async function safeChatCompletion({
   const isGpt5 = GPT5_RE.test(model);
 
   if (isGpt5) {
-    // Helper that tries 'input_text' first, then retries with 'text' on 400 schema errors.
-    const callResponsesCompat = async (mdl, outTok) => {
-      const tryOnce = async (useInputText) => {
-        const input = messages.map((m) => mapMsgForResponses(m, useInputText));
-        return openai.responses.create({ model: mdl, input, temperature, max_output_tokens: outTok });
-      };
-
-      try {
-        return await tryOnce(true); // prefer input_text
-      } catch (e) {
-        const msg = String(e?.message || "");
-        const shouldRetry =
-          /unsupported parameter|invalid value|400/i.test(msg) ||
-          /invalid_request_error/i.test(JSON.stringify(e));
-
-        await dbg("responses_error", {
-          tried: mdl,
-          message: msg.slice(0, 300),
-          status: e?.status ?? null
-        });
-
-        if (!shouldRetry) throw e;
-
-        await dbg("responses_retry_compat", { reason: "switch_to_text_type" });
-        return await tryOnce(false); // retry with type: "text"
-      }
-    };
-
+    const input = messages.map(mapMsgForResponses);
     try {
-      let resp = await callResponsesCompat(model, maxTokens);
-      let text = collapseResponsesText(resp).trim();
-      await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
-
-      if (!text) {
-        const bump = Math.min(maxTokens + 200, 800);
-        await dbg("model_retry_length", { bump });
-        resp = await callResponsesCompat(model, bump);
-        text = collapseResponsesText(resp).trim();
-        await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
-      }
-
+      const resp = await openai.responses.create({
+        model,
+        input,
+        temperature,
+        max_output_tokens: maxTokens,
+      });
+      const text = collapseResponsesText(resp).trim();
+      await dbg("responses_ok", { model: resp?.model, len: text.length, usage: resp?.usage || null });
       return {
         choices: [{ message: { content: text }, finish_reason: text ? "stop" : "length" }],
         model: resp?.model,
         usage: resp?.usage,
       };
     } catch (err) {
-      const emsg = String(err?.message || err || "");
-      const is503 = /503|temporar(il)?y unavailable/i.test(emsg);
-      await dbg("model_fallback", {
-        tried: model,
-        error: `Error: ${emsg}`,
-        status: err?.status ?? null
+      // Log *rich* error details; do not fall back.
+      await dbg("responses_error", {
+        model,
+        status: err?.status ?? null,
+        message: String(err?.message || err),
+        body: err?.response?.data ?? null,
       });
-
-      if (STRICT_GPT5) {
-        // snapshot
-        if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
-          try {
-            const r2 = await callResponsesCompat(CHAT_SNAPSHOT_FALLBACK, maxTokens);
-            const t2 = collapseResponsesText(r2).trim();
-            return { choices: [{ message: { content: t2 }, finish_reason: t2 ? "stop" : "length" }] };
-          } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
-        }
-        // nano (still GPT-5)
-        if (model !== "gpt-5-nano") {
-          try {
-            const r3 = await callResponsesCompat("gpt-5-nano", maxTokens);
-            const t3 = collapseResponsesText(r3).trim();
-            return { choices: [{ message: { content: t3 }, finish_reason: t3 ? "stop" : "length" }] };
-          } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
-        }
-        throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
-      }
-
-      // Non-strict: allow 4o-mini for reliability
-      if (is503) {
-        return await openai.chat.completions.create({
-          model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens,
-        });
-      }
-
-      // snapshot -> nano -> 4o-mini
-      if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
-        try {
-          const r5 = await callResponsesCompat(CHAT_SNAPSHOT_FALLBACK, maxTokens);
-          const t5 = collapseResponsesText(r5).trim();
-          return { choices: [{ message: { content: t5 }, finish_reason: t5 ? "stop" : "length" }] };
-        } catch {}
-      }
-      try {
-        const r6 = await callResponsesCompat("gpt-5-nano", maxTokens);
-        const t6 = collapseResponsesText(r6).trim();
-        return { choices: [{ message: { content: t6 }, finish_reason: t6 ? "stop" : "length" }] };
-      } catch {}
-
-      return await openai.chat.completions.create({
-        model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens,
-      });
+      throw new Error("gpt5_error");
     }
   }
 
-  // Non-GPT-5 -> Chat Completions
+  // Non-GPT-5: no fallback either
   try {
     return await openai.chat.completions.create({
       model, messages, temperature, max_tokens: maxTokens,
     });
   } catch (err) {
-    const emsg = String(err?.message || err || "");
-    await dbg("model_fallback", { tried: model, error: `Error: ${emsg}`, status: err?.status ?? null });
-    return await openai.chat.completions.create({
-      model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens,
+    await dbg("chatcompletions_error", {
+      model, status: err?.status ?? null, message: String(err?.message || err),
     });
+    throw new Error("non_gpt5_error");
   }
 }
 
@@ -976,7 +898,7 @@ export default async function handler(req, res) {
 
     // Context
     const history = cleanHistory(await loadRecentTurns(userId, 40));
-    const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
+    const userContent = visionPart ? [{ type: "input_text", text: userMsg }, visionPart] : userMsg;
     const messages = [
       { role: "system", content: buildSystemPrompt(prior) },
       ...history.slice(-15),
