@@ -53,7 +53,7 @@ function smsNumber(s="") {
 }
 
 /* ---------------- Robust extractor for Responses API ---------------- */
-// Deeply collect any visible text from modern Responses payloads.
+// Deep-walk any modern Responses payload and collect visible text.
 function extractResponseText(resp) {
   if (!resp) return "";
   const chunks = [];
@@ -81,7 +81,7 @@ function extractResponseText(resp) {
   return chunks.join("").trim();
 }
 
-// Summarise content types present (for debugging shapes without dumping huge payloads)
+// Compact summary of content types present (to see where text may hide)
 function summariseContentTypes(resp) {
   const counts = {};
   const visit = (node) => {
@@ -102,8 +102,8 @@ function summariseContentTypes(resp) {
 /* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
 export async function gpt5Reply(userMsg) {
   const INSTRUCTIONS =
-    "Answer the user directly and clearly in 1–4 sentences. " +
-    "Put ONLY your final answer between <final> and </final>. No reasoning text, no preamble.";
+    "Return ONLY the final answer. Be direct and clear in 1–4 sentences. " +
+    "Wrap the final answer like this: <final>...your answer...</final>.";
 
   const extractFinal = (s="") => {
     const m = s.match(/<final>([\s\S]*?)<\/final>/i);
@@ -126,39 +126,48 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // Attempt 1 — explicitly request text channel (OBJECT form)
-  const paramsTextFmt = {
-    model: CHAT_MODEL,                // e.g. "gpt-5"
+  // Attempt 1 — Force JSON output via text.format=json_object, then parse { "final": "..." }
+  const paramsJson = {
+    model: CHAT_MODEL,
     max_output_tokens: 300,
-    instructions: INSTRUCTIONS,
-    text: { format: { type: "text" } },   // <-- critical for some GPT-5 snapshots
-    input: [
-      { role: "user", content: [{ type: "input_text", text: userMsg }] }
-    ],
+    instructions:
+      "Respond ONLY as a single JSON object with this exact shape: {\"final\":\"...\"}. " +
+      "Do not include any other keys, markdown, or text outside JSON. " +
+      "Put the final human-facing answer in the \"final\" field.",
+    text: { format: { type: "json_object" } }, // request visible JSON text channel
+    input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
-
-  let r = await callWithTimeout(paramsTextFmt, "gpt5_textfmt");
+  let r = await callWithTimeout(paramsJson, "gpt5_jsonfmt");
   if (r?.__timeout) {
-    await dbg("gpt5_timeout", { attempt: "textfmt", ms: LLM_TIMEOUT_MS });
+    await dbg("gpt5_timeout", { attempt: "jsonfmt", ms: LLM_TIMEOUT_MS });
     return "Sorry—took too long to respond.";
   }
   if (r?.__error) {
     const msg = String(r.__error?.message || r.__error);
-    await dbg("gpt5_error", { attempt: "textfmt", message: msg });
-    // Only fall through if the error complains about text/format params
+    await dbg("gpt5_error", { attempt: "jsonfmt", message: msg });
+    // If the snapshot dislikes text/format, fall through to next attempts.
     if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(msg)) {
       return "Model error: " + msg;
     }
   } else {
-    const text = extractFinal(extractResponseText(r)) || extractResponseText(r);
+    const all = extractResponseText(r);
+    let final = "";
+    try {
+      // Model may return JSON either as output_text or inside a text node
+      const start = all.indexOf("{"); const end = all.lastIndexOf("}");
+      const raw = (start >= 0 && end >= 0) ? all.slice(start, end + 1) : all;
+      const j = JSON.parse(raw);
+      if (j && typeof j.final === "string") final = j.final.trim();
+    } catch { /* ignore and continue */ }
     await dbg("gpt5_reply", {
-      model: r?.model, usage: r?.usage, len: (text||"").length,
-      types: summariseContentTypes(r), preview: (text||"").slice(0,160)
+      attempt: "jsonfmt", model: r?.model, usage: r?.usage,
+      len: (final||"").length, types: summariseContentTypes(r),
+      preview: (final||"").slice(0,160)
     });
-    if (text) return text;
+    if (final) return final;
   }
 
-  // Attempt 2 — items with input_text (no text.format)
+  // Attempt 2 — items with input_text (no text.format) + <final> contract
   const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
@@ -171,17 +180,19 @@ export async function gpt5Reply(userMsg) {
     return "Sorry—took too long to respond.";
   }
   if (!r?.__error) {
-    const text = extractFinal(extractResponseText(r)) || extractResponseText(r);
+    const all = extractResponseText(r);
+    const final = extractFinal(all) || all;
     await dbg("gpt5_reply", {
-      model: r?.model, usage: r?.usage, len: (text||"").length,
-      types: summariseContentTypes(r), preview: (text||"").slice(0,160)
+      attempt: "items", model: r?.model, usage: r?.usage,
+      len: (final||"").length, types: summariseContentTypes(r),
+      preview: (final||"").slice(0,160)
     });
-    if (text) return text;
+    if (final) return final;
   } else {
     await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // Attempt 3 — plain string input (minimal shape)
+  // Attempt 3 — plain string input (minimal shape) + <final> contract
   const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
@@ -194,12 +205,14 @@ export async function gpt5Reply(userMsg) {
     return "Sorry—took too long to respond.";
   }
   if (!r?.__error) {
-    const text = extractFinal(extractResponseText(r)) || extractResponseText(r);
+    const all = extractResponseText(r);
+    const final = extractFinal(all) || all;
     await dbg("gpt5_reply_retry", {
-      model: r?.model, usage: r?.usage, len: (text||"").length,
-      types: summariseContentTypes(r), preview: (text||"").slice(0,160)
+      attempt: "string", model: r?.model, usage: r?.usage,
+      len: (final||"").length, types: summariseContentTypes(r),
+      preview: (final||"").slice(0,160)
     });
-    if (text) return text;
+    if (final) return final;
   } else {
     await dbg("gpt5_error_retry", { attempt: "string", message: String(r.__error?.message || r.__error) });
   }
