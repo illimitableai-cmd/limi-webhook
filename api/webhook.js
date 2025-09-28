@@ -8,7 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 /** --- ENV ---
  * Required: OPENAI_KEY, TWILIO_SID, TWILIO_AUTH, TWILIO_FROM
  * Optional: TWILIO_WHATSAPP_FROM (format: whatsapp:+447...)
- * Optional: OPENAI_CHAT_MODEL (default: gpt-5-mini), LLM_TIMEOUT_MS
+ * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS
  * For debug logs: SUPABASE_URL, SUPABASE_KEY and a table `debug_logs`
  */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-mini"; // <-- current rolling model
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // <-- full GPT-5 rolling release
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -83,9 +83,9 @@ export async function gpt5Reply(userMsg) {
 
   const params = {
     model: CHAT_MODEL,
-    max_output_tokens: 220,
+    max_output_tokens: 300, // <-- increased for longer replies
     instructions:
-      "Answer the user directly and clearly in 1–3 short sentences. " +
+      "Answer the user directly and clearly in 1–4 sentences. " +
       "Put ONLY your final answer between <final> and </final>. No reasoning text.",
     input: [
       { role: "user", content: [{ type: "input_text", text: userMsg }] }
