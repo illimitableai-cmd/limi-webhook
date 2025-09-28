@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // full GPT-5 (rolling)
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // full GPT-5 (rolling alias)
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -72,7 +72,7 @@ export async function gpt5Reply(userMsg) {
     "Answer the user directly and clearly in 1–4 sentences. " +
     "Put ONLY your final answer between <final> and </final>. No reasoning text, no preamble.";
 
-  function extractFinal(text="") {
+  function extractFinal(text = "") {
     const m = text.match(/<final>([\s\S]*?)<\/final>/i);
     return m ? m[1].trim() : "";
   }
@@ -85,8 +85,8 @@ export async function gpt5Reply(userMsg) {
       model: params.model,
       input_preview:
         typeof params.input === "string"
-          ? params.input.slice(0,160)
-          : (JSON.stringify(params.input || "").slice(0,160))
+          ? params.input.slice(0, 160)
+          : (JSON.stringify(params.input || "").slice(0, 160))
     });
     const p = openai.responses.create(params);
     return new Promise((resolve) => {
@@ -96,12 +96,12 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // Attempt 1 — Request explicit text output channel (supported by GPT-5 full snapshots)
+  // Attempt 1 — explicit text format (OBJECT form)
   const paramsTextFmt = {
-    model: CHAT_MODEL,
+    model: CHAT_MODEL,                // e.g. "gpt-5"
     max_output_tokens: 300,
     instructions: INSTRUCTIONS,
-    text: { format: "text" },           // <— key difference
+    text: { format: { type: "text" } },   // <— important: object with { type: "text" }
     input: [
       { role: "user", content: [{ type: "input_text", text: userMsg }] }
     ],
@@ -109,13 +109,10 @@ export async function gpt5Reply(userMsg) {
   let r = await callWithTimeout(paramsTextFmt, "gpt5_textfmt");
   if (r?.__timeout) { await dbg("gpt5_timeout", { attempt: "textfmt" }); return "Sorry—took too long to respond."; }
   if (r?.__error) {
-    const m = String(r.__error?.message || r.__error);
-    await dbg("gpt5_error", { attempt: "textfmt", message: m });
-
-    // If the snapshot rejects `text`/`text.format`, fall through to the plain variants below.
-    if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(m)) {
-      // Real error unrelated to text.format — surface it.
-      return "Model error: " + m;
+    const msg = String(r.__error?.message || r.__error);
+    await dbg("gpt5_error", { attempt: "textfmt", message: msg });
+    if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(msg)) {
+      return "Model error: " + msg; // real error not related to text.format -> surface it
     }
   } else {
     const t = visible(r);
@@ -123,7 +120,7 @@ export async function gpt5Reply(userMsg) {
     if (t) return t;
   }
 
-  // Attempt 2 — Items with input_text (no text.format)
+  // Attempt 2 — items with input_text (no text.format)
   const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
@@ -142,7 +139,7 @@ export async function gpt5Reply(userMsg) {
     if (t) return t;
   }
 
-  // Attempt 3 — Plain string input (some snapshots prefer minimal shape)
+  // Attempt 3 — plain string input (minimal shape)
   const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
