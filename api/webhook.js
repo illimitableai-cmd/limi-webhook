@@ -126,20 +126,18 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // --- Attempt 1: JSON (validator needs the word "JSON" in input messages)
+  // --- Attempt 1: JSON via response_format (requires the word "JSON" in input messages)
   const paramsJson = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
+    response_format: { type: "json_object" }, // ✅ supported in Responses/Chat APIs
     instructions:
-      "Respond ONLY as a single JSON object with this exact shape: {\"final\":\"...\"}. " +
-      "Do not include any other keys, markdown, or text outside JSON. " +
-      "Put the final human-facing answer in the \"final\" field.",
-    tools: [{ type: "text", format: { type: "json_object" } }], // ✅ correct shape
+      "You are an SMS assistant. Output JSON only.",
     input: [
       {
         role: "system",
         content: [
-          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object." } // ✅ contains “JSON”
+          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." } // ✅ contains “JSON”
         ]
       },
       { role: "user", content: [{ type: "input_text", text: userMsg }]}
@@ -170,11 +168,10 @@ export async function gpt5Reply(userMsg) {
     await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
   }
 
-  // --- Attempt 2: normal text via items + <final> contract
+  // --- Attempt 2: normal text via items + <final> contract (no tools)
   const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
-    tools: [{ type: "text" }], // ✅ ensure text tool is present
     instructions: INSTRUCTIONS,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
@@ -196,11 +193,10 @@ export async function gpt5Reply(userMsg) {
     await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // --- Attempt 3: plain string input + text tool
+  // --- Attempt 3: plain string input + <final> contract (no tools)
   const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
-    tools: [{ type: "text" }], // ✅ ensure text tool is present
     instructions: INSTRUCTIONS,
     input: `User: ${userMsg}\n\n<final>`,
   };
