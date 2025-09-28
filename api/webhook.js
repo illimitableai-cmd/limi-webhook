@@ -68,69 +68,94 @@ function collapseResponsesText(resp) {
 
 /* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
 export async function gpt5Reply(userMsg) {
-  function extractFinalBlock(s="") {
-    const m = s.match(/<final>([\s\S]*?)<\/final>/i);
-    return m ? m[1].trim() : "";
-  }
-  async function callWithTimeout(params, timeoutMs, dbgLabel) {
-    await dbg(dbgLabel + "_request", {
-      model: params.model,
-      input_preview: typeof params.input === "string"
-        ? params.input.slice(0,160)
-        : (JSON.stringify(params.input)?.slice(0,160) || "")
-    });
-    const p = openai.responses.create(params);
-    return new Promise((resolve) => {
-      const t = setTimeout(() => resolve({ __timeout: true }), timeoutMs);
-      p.then((r) => { clearTimeout(t); resolve(r); })
-       .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
-    });
-  }
-  function getVisibleText(resp) {
-    const raw = (collapseResponsesText(resp) || "").trim();
-    const finalOnly = extractFinalBlock(raw);
-    return (finalOnly || raw).trim();
-  }
-
-  // Shared knobs
   const INSTRUCTIONS =
     "Answer the user directly and clearly in 1–4 sentences. " +
     "Put ONLY your final answer between <final> and </final>. No reasoning text, no preamble.";
 
-  // Attempt 1: items with input_text (most compatible)
-  const params1 = {
-    model: CHAT_MODEL,
-    max_output_tokens: 300, // longer replies
-    instructions: INSTRUCTIONS,
-    input: [
-      { role: "user", content: [{ type: "input_text", text: userMsg }] }
-    ]
-  };
-
-  const r1 = await callWithTimeout(params1, LLM_TIMEOUT_MS, "gpt5A");
-  if (r1?.__timeout) { await dbg("gpt5_timeout", { attempt: "A", ms: LLM_TIMEOUT_MS }); return "Sorry—took too long to respond."; }
-  if (r1?.__error)   { await dbg("gpt5_error", { attempt: "A", message: String(r1.__error?.message || r1.__error) }); }
-  else {
-    const text1 = getVisibleText(r1);
-    await dbg("gpt5_reply", { model: r1?.model, usage: r1?.usage, len: text1.length, preview: text1.slice(0,160) });
-    if (text1) return text1;
+  function extractFinal(text="") {
+    const m = text.match(/<final>([\s\S]*?)<\/final>/i);
+    return m ? m[1].trim() : "";
+  }
+  function visible(resp) {
+    const raw = (collapseResponsesText(resp) || "").trim();
+    return extractFinal(raw) || raw;
+  }
+  async function callWithTimeout(params, dbgLabel) {
+    await dbg(dbgLabel + "_request", {
+      model: params.model,
+      input_preview:
+        typeof params.input === "string"
+          ? params.input.slice(0,160)
+          : (JSON.stringify(params.input || "").slice(0,160))
+    });
+    const p = openai.responses.create(params);
+    return new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
+      p.then((r) => { clearTimeout(t); resolve(r); })
+       .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+    });
   }
 
-  // Attempt 2: plain string input (some snapshots prefer this minimal shape)
-  const params2 = {
+  // Attempt 1 — Request explicit text output channel (supported by GPT-5 full snapshots)
+  const paramsTextFmt = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
     instructions: INSTRUCTIONS,
-    input: `User: ${userMsg}\n\n<final>`
+    text: { format: "text" },           // <— key difference
+    input: [
+      { role: "user", content: [{ type: "input_text", text: userMsg }] }
+    ],
   };
+  let r = await callWithTimeout(paramsTextFmt, "gpt5_textfmt");
+  if (r?.__timeout) { await dbg("gpt5_timeout", { attempt: "textfmt" }); return "Sorry—took too long to respond."; }
+  if (r?.__error) {
+    const m = String(r.__error?.message || r.__error);
+    await dbg("gpt5_error", { attempt: "textfmt", message: m });
 
-  const r2 = await callWithTimeout(params2, Math.max(3000, Math.floor(LLM_TIMEOUT_MS/2)), "gpt5S");
-  if (r2?.__timeout) { await dbg("gpt5_timeout_retry", { attempt: "S" }); return "Sorry—took too long to respond."; }
-  if (r2?.__error)   { await dbg("gpt5_error_retry", { attempt: "S", message: String(r2.__error?.message || r2.__error) }); }
+    // If the snapshot rejects `text`/`text.format`, fall through to the plain variants below.
+    if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(m)) {
+      // Real error unrelated to text.format — surface it.
+      return "Model error: " + m;
+    }
+  } else {
+    const t = visible(r);
+    await dbg("gpt5_reply", { model: r?.model, usage: r?.usage, len: t.length, preview: t.slice(0,160) });
+    if (t) return t;
+  }
+
+  // Attempt 2 — Items with input_text (no text.format)
+  const paramsItems = {
+    model: CHAT_MODEL,
+    max_output_tokens: 300,
+    instructions: INSTRUCTIONS,
+    input: [
+      { role: "user", content: [{ type: "input_text", text: userMsg }] }
+    ],
+  };
+  r = await callWithTimeout(paramsItems, "gpt5_items");
+  if (r?.__timeout) { await dbg("gpt5_timeout", { attempt: "items" }); return "Sorry—took too long to respond."; }
+  if (r?.__error) {
+    await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
+  } else {
+    const t = visible(r);
+    await dbg("gpt5_reply", { model: r?.model, usage: r?.usage, len: t.length, preview: t.slice(0,160) });
+    if (t) return t;
+  }
+
+  // Attempt 3 — Plain string input (some snapshots prefer minimal shape)
+  const paramsString = {
+    model: CHAT_MODEL,
+    max_output_tokens: 300,
+    instructions: INSTRUCTIONS,
+    input: `User: ${userMsg}\n\n<final>`,
+  };
+  r = await callWithTimeout(paramsString, "gpt5_string");
+  if (r?.__timeout) { await dbg("gpt5_timeout_retry", { attempt: "string" }); return "Sorry—took too long to respond."; }
+  if (r?.__error)   { await dbg("gpt5_error_retry", { attempt: "string", message: String(r.__error?.message || r.__error) }); }
   else {
-    const text2 = getVisibleText(r2);
-    await dbg("gpt5_reply_retry", { model: r2?.model, usage: r2?.usage, len: text2.length, preview: text2.slice(0,160) });
-    if (text2) return text2;
+    const t = visible(r);
+    await dbg("gpt5_reply_retry", { model: r?.model, usage: r?.usage, len: t.length, preview: t.slice(0,160) });
+    if (t) return t;
   }
 
   await dbg("gpt5_empty_after_retry", { model: CHAT_MODEL });
@@ -179,7 +204,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // SMS photo guard (UK)
+    // UK SMS photo guard
     if (!isWhatsApp && NumMedia > 0) {
       res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
