@@ -35,7 +35,10 @@ async function dbg(step, payload) {
 
 /* ---------------- Small utils ---------------- */
 function toXml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/<//g,"&lt;").replace(/>/g,"&gt;");
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
