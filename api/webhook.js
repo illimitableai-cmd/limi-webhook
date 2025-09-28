@@ -11,13 +11,13 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 
 // --- Twilio senders
-const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // E.164 for SMS
+const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS number (E.164)
 const TWILIO_WHATSAPP_FROM_RAW = (process.env.TWILIO_WHATSAPP_FROM || TWILIO_FROM || "").trim();
 const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
   ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
   : "";
 
-// ===== Models (default: GPT-5 mini)
+// ===== Models (default to GPT-5 mini; snapshot stays in the family)
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-mini";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-mini-2025-08-07";
@@ -26,8 +26,8 @@ const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
-// Keep responses inside GPT-5 family (mini → snapshot → nano). No 4o fallback when =1
-const STRICT_GPT5       = process.env.STRICT_GPT5 === "1";
+// Default to GPT-5-only behavior unless explicitly disabled
+const STRICT_GPT5       = process.env.STRICT_GPT5 !== "0";
 
 // FREE TRIAL
 const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
@@ -35,11 +35,13 @@ const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 // ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 const FORCE_DIRECT    = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
-// Tight timeout to avoid Twilio/Vercel timeouts
+// Tight timeout to avoid Twilio/Vercel 11200/502s
 const LLM_TIMEOUT_MS  = Number(process.env.LLM_TIMEOUT_MS || 4500);
 
-// ---------- tiny utils ----------
-function escapeXml(s = "") { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+// ---------- Small utils ----------
+function escapeXml(s = "") {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 function toGsm7(s = "") {
   return (s || "")
     .replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
@@ -58,67 +60,120 @@ async function dbg(step, payload, userId = null) {
   catch (e) { console.error("dbg fail", e); }
 }
 
-// ---------- OpenAI wrapper ----------
+// ---------- OpenAI wrappers ----------
 const GPT5_RE = /^gpt-5/i;
 
-async function safeChatCompletion({ messages, model = CHAT_MODEL, temperature = 0.2, maxTokens = 220 }) {
+async function safeChatCompletion({
+  messages,
+  model = CHAT_MODEL,
+  temperature = 0.2,
+  maxTokens = 220,
+}) {
   const isGpt5 = GPT5_RE.test(model);
-  const args = { model, messages };
-  if (isGpt5) args.max_completion_tokens = maxTokens;
-  else { args.max_tokens = maxTokens; args.temperature = temperature; }
+
+  // Force plain text output to avoid non-text shapes
+  const base = {
+    model,
+    messages,
+    n: 1,
+    response_format: { type: "text" },
+    temperature: isGpt5 ? undefined : temperature,
+  };
+
+  const args = isGpt5
+    ? { ...base, max_completion_tokens: maxTokens }
+    : { ...base, max_tokens: maxTokens };
 
   try {
-    return await openai.chat.completions.create(args);
+    let resp = await openai.chat.completions.create(args);
+
+    // Instrument + handle finish_reason/empties
+    const choice = resp?.choices?.[0];
+    const finish = choice?.finish_reason || null;
+    const content = (choice?.message?.content ?? "").trim();
+    await dbg("model_meta", {
+      model: resp?.model,
+      finish_reason: finish,
+      len: content.length,
+      usage: resp?.usage || null,
+    });
+
+    // If we hit cap, retry once with a bump (stay small to fit SMS)
+    if (!content && finish === "length") {
+      const bump = Math.min(maxTokens + 180, 600);
+      const retryArgs = isGpt5
+        ? { ...args, max_completion_tokens: bump }
+        : { ...args, max_tokens: bump };
+      await dbg("model_retry_length", { bump });
+      resp = await openai.chat.completions.create(retryArgs);
+      return resp;
+    }
+
+    return resp;
+
   } catch (err) {
     const emsg = String(err?.message || err || "");
     const is503 = emsg.includes("503") || /temporar(il)?y unavailable/i.test(emsg);
     await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
 
-    // STRICT mode: keep inside GPT-5 family only
+    // STRICT GPT-5: never fall back to 4o
     if (STRICT_GPT5) {
-      // 1) pinned snapshot (still GPT-5)
+      // 1) Pinned snapshot
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
         try {
           const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
-          if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) { delete a2.max_tokens; delete a2.temperature; a2.max_completion_tokens = maxTokens; }
+          if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) {
+            delete a2.max_tokens; a2.max_completion_tokens = maxTokens;
+          }
           return await openai.chat.completions.create(a2);
         } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
       }
-      // 2) nano as a last-ditch within family
+      // 2) vanilla nano (still GPT-5 family)
       if (model !== "gpt-5-nano") {
         try {
           const a3 = { ...args, model: "gpt-5-nano" };
-          delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
+          delete a3.max_tokens; a3.max_completion_tokens = maxTokens;
           return await openai.chat.completions.create(a3);
         } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
       }
-      // Give up (caller handles)
       throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
     }
 
-    // Non-strict: final fallback to 4o-mini if a 503/hiccup
+    // Non-strict: fall back to 4o-mini only for service hiccups
     if (is503) {
       return await openai.chat.completions.create({
         model: "gpt-4o-mini",
-        messages, temperature: 0.2, max_tokens: maxTokens
+        messages,
+        temperature: 0.2,
+        max_tokens: maxTokens,
+        response_format: { type: "text" },
       });
     }
-    // Else try snapshot then nano
+
+    // Try snapshot, then nano, then 4o-mini
     if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
       try {
         const a2 = { ...args, model: CHAT_SNAPSHOT_FALLBACK };
-        if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) { delete a2.max_tokens; delete a2.temperature; a2.max_completion_tokens = maxTokens; }
+        if (GPT5_RE.test(CHAT_SNAPSHOT_FALLBACK)) {
+          delete a2.max_tokens; a2.max_completion_tokens = maxTokens;
+        }
         return await openai.chat.completions.create(a2);
       } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
     }
     if (model !== "gpt-5-nano") {
       try {
         const a3 = { ...args, model: "gpt-5-nano" };
-        delete a3.max_tokens; delete a3.temperature; a3.max_completion_tokens = maxTokens;
+        delete a3.max_tokens; a3.max_completion_tokens = maxTokens;
         return await openai.chat.completions.create(a3);
       } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
     }
-    return await openai.chat.completions.create({ model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens });
+    return await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      temperature: 0.2,
+      max_tokens: maxTokens,
+      response_format: { type: "text" },
+    });
   }
 }
 
@@ -178,7 +233,7 @@ async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPL
   }
 }
 
-// ---------- Twilio send & respond ----------
+// ---------- Twilio send helpers ----------
 async function sendDirect({ channel, to, body }) {
   const safeBody = toGsm7(body);
   try {
@@ -199,6 +254,8 @@ async function sendDirect({ channel, to, body }) {
     return false;
   }
 }
+
+// Try direct (if allowed). If it fails, immediately answer with TwiML.
 async function respondDirectOrTwiml(res, { channel, to, body, allowDirect }) {
   let usedDirect = false, ok = false;
   if (allowDirect) { usedDirect = true; ok = await sendDirect({ channel, to, body }); }
@@ -223,7 +280,7 @@ async function fetchTwilioMediaB64(url) {
   return buf.toString("base64");
 }
 
-// ---------- Memory snapshot ----------
+// ---------- Memory + snapshot ----------
 function blankMemory() {
   return { name: null, location: null, email: null, birthday: null, timezone: null, preferences: {}, interests: [], goals: [], notes: [], convo_summary: "", last_seen: new Date().toISOString() };
 }
@@ -279,7 +336,7 @@ async function summariseConversation({ priorSummary = "", history = [], latestUs
   return (c.choices?.[0]?.message?.content || "").trim().slice(0, 1200);
 }
 
-// -------------- Name/phone & contacts --------------
+// -------------- Name/phone utilities --------------
 function sanitizeName(raw = "") {
   let n = String(raw)
     .replace(/['’]\s*s\b/gi, "")
@@ -307,7 +364,7 @@ function normalizePhone(phone = "") {
   return d;
 }
 
-// DB helpers
+// -------------- DB helpers --------------
 async function getOrCreateUserId(identifier) {
   const { data: ident } = await supabase
     .from("identifiers").select("user_id").eq("value", identifier).maybeSingle();
@@ -355,7 +412,7 @@ async function ensureCredits(userId) {
   return data.balance ?? 0;
 }
 
-// Contacts helpers
+// -------------- Contacts --------------
 async function upsertContact({ userId, name, phone, channel }) {
   const tidyIncoming = sanitizeName(name);
   const normPhone = normalizePhone(phone);
@@ -421,6 +478,7 @@ function parseSaveContact(msg) {
   const tidyName = sanitizeName(name);
   const normPhone = normalizePhone(phone);
   if (isBadName(tidyName)) return null;
+
   return { name: tidyName, phone: normPhone };
 }
 async function llmExtractContact(msg) {
@@ -443,8 +501,6 @@ async function llmExtractContact(msg) {
   } catch {}
   return null;
 }
-
-// Intent helpers
 function isContactListQuery(text = "") {
   const t = (text || "").trim().toLowerCase();
   return (
@@ -688,14 +744,7 @@ export default async function handler(req, res) {
       return res.status(200).send("<Response><Message>Top up here: https://illimitableai.com/buy</Message></Response>");
     }
 
-    // === Credits gate
-    const credits = await ensureCredits(userId);
-    if (credits <= 0) {
-      res.setHeader("Content-Type","text/xml");
-      return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
-    }
-
-    // QUICK “name” save
+    // QUICK PATHS (no model)
     const quickName = extractNameQuick(body);
     if (quickName) {
       const { data: memRow0 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
@@ -708,21 +757,28 @@ export default async function handler(req, res) {
         const ack = `Nice to meet you, ${quickName}. I’ll remember that.`;
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", ack, channel, from);
-        return respondDirectOrTwiml(res, { channel, to: from, body: ack, allowDirect: channel === "sms" && FORCE_DIRECT });
+        res.setHeader("Content-Type", "text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(ack)}</Message></Response>`);
       }
     }
-
-    // “What is my name?”
     if (/^\s*what('?| i)?s?\s+my\s+name\??\s*$/i.test(body) || /^\s*what\s+is\s+my\s+name\??\s*$/i.test(body)) {
       const { data: memRow1 } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
       const name = memRow1?.summary?.name;
       const msg = name ? `Your name is ${name}.` : "I don’t have your name yet. What’s your first name so I can save it?";
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", msg, channel, from);
-      return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: channel === "sms" && FORCE_DIRECT });
+      res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // ----- Emergency paths -----
+    // === Credits gate
+    const credits = await ensureCredits(userId);
+    if (credits <= 0) {
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response><Message>Out of credits. Reply BUY for a top-up link.</Message></Response>");
+    }
+
+    // Contacts / Emergency (gated)
     if (ENABLE_EMERGENCY) {
       const emgNLU = await emgExtractNatural(body);
       if (emgNLU && emgNLU.intent && emgNLU.intent !== "none") {
@@ -735,18 +791,22 @@ export default async function handler(req, res) {
             channel: ["sms","whatsapp","both"].includes(channelPref) ? channelPref : "both",
           });
           const msg = r.ok
-            ? (r.action === "insert" || r.action === "update_phone" ? `Added emergency contact: ${sanitizeName(emgNLU.name)}.` : `Updated emergency contact: ${sanitizeName(emgNLU.name)}.`)
+            ? (r.action === "insert" || r.action === "update_phone"
+                ? `Added emergency contact: ${sanitizeName(emgNLU.name)}.`
+                : `Updated emergency contact: ${sanitizeName(emgNLU.name)}.`)
             : "Sorry, I couldn't save that emergency contact.";
           await saveTurn(userId, "user", body, channel, from);
           await saveTurn(userId, "assistant", msg, channel, from);
-          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+          await respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+          return;
         }
         if (emgNLU.intent === "remove" && emgNLU.name) {
           const ok = await removeEmergencyContact(userId, emgNLU.name);
           const msg = ok ? `Removed emergency contact: ${sanitizeName(emgNLU.name)}.` : "Sorry, I couldn't remove that emergency contact.";
           await saveTurn(userId, "user", body, channel, from);
           await saveTurn(userId, "assistant", msg, channel, from);
-          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+          await respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+          return;
         }
         if (emgNLU.intent === "list") {
           const list = await listEmergencyContacts(userId);
@@ -755,17 +815,18 @@ export default async function handler(req, res) {
             : "You have no emergency contacts yet. You can say things like “add my mum to my emergency contacts, 07123 456789”.";
           await saveTurn(userId, "user", body, channel, from);
           await saveTurn(userId, "assistant", msg, channel, from);
-          return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+          await respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+          return;
         }
       }
-
       const addEmg = parseAddEmergency(body);
       if (addEmg) {
         const r = await upsertEmergencyContact({ userId, ...addEmg });
         const msg = r.ok ? (r.action === "insert" ? `Added emergency contact: ${addEmg.name}.` : `Updated emergency contact: ${addEmg.name}.`) : "Sorry, I couldn't save that emergency contact.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        await respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        return;
       }
       const remEmg = parseRemoveEmergency(body);
       if (remEmg) {
@@ -773,7 +834,8 @@ export default async function handler(req, res) {
         const msg = ok ? `Removed emergency contact: ${remEmg}.` : "Sorry, I couldn't remove that emergency contact.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        await respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        return;
       }
       if (isEmergencyContactListQuery(body)) {
         const list = await listEmergencyContacts(userId);
@@ -784,7 +846,8 @@ export default async function handler(req, res) {
         } else msg += " Add one like: add emergency contact Alex +447700900000 sms";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
       }
       if (isHelpTrigger(body)) {
         const result = await sendEmergencyAlert({ userId, from });
@@ -795,11 +858,11 @@ export default async function handler(req, res) {
         else msg = "Sorry, I couldn't send the alert right now.";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", msg, channel, from);
-        return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        await respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+        return;
       }
     }
 
-    // Contacts list
     if (ENABLE_CONTACTS && isContactListQuery(body)) {
       const { data: contacts, error: listErr } = await supabase
         .from("contacts")
@@ -819,10 +882,11 @@ export default async function handler(req, res) {
 
       await saveTurn(userId, "user", body, channel, from);
       await saveTurn(userId, "assistant", msg, channel, from);
-      return respondDirectOrTwiml(res, { channel, to: from, body: msg, allowDirect: false });
+
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
 
-    // Possible “save contact”
     if (ENABLE_CONTACTS) {
       let contact = parseSaveContact(body);
       if (!contact) {
@@ -834,25 +898,12 @@ export default async function handler(req, res) {
         const verb = result?.action === "insert_new" ? "Saved" : "Updated";
         await saveTurn(userId, "user", body, channel, from);
         await saveTurn(userId, "assistant", `${verb} ${contact.name}`, channel, from);
-        return respondDirectOrTwiml(res, { channel, to: from, body: `${verb} ${contact.name}`, allowDirect: false });
+        res.setHeader("Content-Type","text/xml");
+        return res.status(200).send(`<Response><Message>${escapeXml(`${verb} ${contact.name}`)}</Message></Response>`);
       }
     }
 
-    // BASIC fast path (if enabled)
-    if (BASIC_MODE) {
-      const messages = [
-        { role: "system", content: "You are Limi, a concise UK-English SMS assistant. Always answer directly." },
-        { role: "user", content: body }
-      ];
-      const c = await watchdog(safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }), LLM_TIMEOUT_MS, "");
-      let reply = (c?.choices?.[0]?.message?.content || "").trim();
-      if (!reply) reply = "I’ll answer in a moment.";
-      await saveTurn(userId, "user", body, channel, from);
-      await saveTurn(userId, "assistant", reply, channel, from);
-      return respondDirectOrTwiml(res, { channel, to: from, body: reply, allowDirect: channel === "sms" && FORCE_DIRECT });
-    }
-
-    // === Full chat ===
+    // Memory + media
     const { data: memRow } = await supabase.from("memories").select("summary").eq("user_id", userId).maybeSingle();
     const prior = memRow?.summary ?? blankMemory();
 
@@ -869,6 +920,7 @@ export default async function handler(req, res) {
 
     await saveTurn(userId, "user", userMsg, channel, from);
 
+    // Context
     const history = cleanHistory(await loadRecentTurns(userId, 40));
     const userContent = visionPart ? [{ type: "text", text: userMsg }, visionPart] : userMsg;
     const messages = [
@@ -877,6 +929,7 @@ export default async function handler(req, res) {
       { role: "user", content: userContent },
     ];
 
+    // ===== Main answer (bounded)
     let completion = await watchdog(
       safeChatCompletion({ model: CHAT_MODEL, messages, maxTokens: 220 }),
       LLM_TIMEOUT_MS,
@@ -884,8 +937,27 @@ export default async function handler(req, res) {
     );
 
     const initialTimedOut = !!completion?.__timeout;
-    let rawModelText = initialTimedOut ? "" : (completion.choices?.[0]?.message?.content?.trim() || "");
-    await dbg("model_reply_raw", { len: rawModelText.length, timeout: initialTimedOut }, userId);
+    let rawModelText = "";
+    let finishReason = null;
+
+    if (!initialTimedOut && completion?.choices?.length) {
+      const ch = completion.choices[0];
+      rawModelText = (ch?.message?.content ?? "").trim();
+      finishReason = ch?.finish_reason || null;
+    }
+    await dbg("model_reply_raw", { len: (rawModelText || "").length, timeout: initialTimedOut, finish_reason: finishReason }, userId);
+
+    if (!initialTimedOut && rawModelText.length === 0) {
+      const forced = await watchdog(
+        forceAnswer(userMsg, (prior?.convo_summary || "")),
+        Math.max(1500, Math.floor(LLM_TIMEOUT_MS / 2)),
+        ""
+      );
+      if (typeof forced === "string" && forced.trim()) {
+        rawModelText = forced.trim();
+        await dbg("forced_answer_used", { len: rawModelText.length, snippet: rawModelText.slice(0,160) }, userId);
+      }
+    }
 
     let reply = rawModelText || "I’ll answer in a moment.";
     if (!initialTimedOut && reply === rawModelText) {
@@ -900,7 +972,7 @@ export default async function handler(req, res) {
     await saveTurn(userId, "assistant", finalReply, channel, from);
     await setCredits(userId, Math.max(0, credits - 1));
 
-    // send immediately to avoid 502s
+    // SEND immediately (avoid Twilio 11200)
     await respondDirectOrTwiml(res, {
       channel,
       to: from,
@@ -908,7 +980,7 @@ export default async function handler(req, res) {
       allowDirect: channel === "sms" && FORCE_DIRECT
     });
 
-    // best-effort summary (out of band)
+    // Best-effort memory update
     try {
       const slimHistory = history.slice(-10);
       const newSummary = await summariseConversation({ priorSummary: prior.convo_summary || "", history: slimHistory, latestUser: userMsg });
