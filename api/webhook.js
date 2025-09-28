@@ -11,13 +11,15 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
 
 // --- Twilio senders
-const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // SMS/Mixed number (E.164)
+const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim(); // E.164 SMS/Mixed
 const TWILIO_WHATSAPP_FROM_RAW = (process.env.TWILIO_WHATSAPP_FROM || TWILIO_FROM || "").trim();
 const TWILIO_WHATSAPP_FROM = TWILIO_WHATSAPP_FROM_RAW
-  ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:") ? TWILIO_WHATSAPP_FROM_RAW : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
+  ? (TWILIO_WHATSAPP_FROM_RAW.startsWith("whatsapp:")
+      ? TWILIO_WHATSAPP_FROM_RAW
+      : `whatsapp:${TWILIO_WHATSAPP_FROM_RAW}`)
   : ""; // must be a WA-enabled sender
 
-// ===== Models: default to GPT-5 mini (snapshot stays in the family)
+// ===== Models
 const CHAT_MODEL   = process.env.OPENAI_CHAT_MODEL   || "gpt-5-mini";
 const MEMORY_MODEL = process.env.OPENAI_MEMORY_MODEL || CHAT_MODEL;
 const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt-5-mini-2025-08-07";
@@ -26,7 +28,6 @@ const CHAT_SNAPSHOT_FALLBACK = process.env.OPENAI_CHAT_SNAPSHOT_FALLBACK || "gpt
 const BASIC_MODE        = process.env.BASIC_MODE === "1";
 const ENABLE_CONTACTS   = process.env.ENABLE_CONTACTS !== "0";
 const ENABLE_EMERGENCY  = process.env.ENABLE_EMERGENCY !== "0";
-// Keep fallbacks inside GPT-5 family unless explicitly disabled
 const STRICT_GPT5       = process.env.STRICT_GPT5 !== "0";
 
 // FREE TRIAL
@@ -35,7 +36,6 @@ const FREE_TRIAL_CREDITS = Number(process.env.FREE_TRIAL_CREDITS || 20);
 // ===== Time + reply guards
 const MIN_REPLY_CHARS = Number(process.env.MIN_REPLY_CHARS || 60);
 const FORCE_DIRECT    = process.env.TWILIO_FORCE_DIRECT_SEND === "1";
-// Tight timeout to avoid Twilio/Vercel 11200/502s
 const LLM_TIMEOUT_MS  = Number(process.env.LLM_TIMEOUT_MS || 4500);
 
 // ---------- Small utils ----------
@@ -60,35 +60,45 @@ async function dbg(step, payload, userId = null) {
   catch (e) { console.error("dbg fail", e); }
 }
 
-// ---------- Responses API helpers (for GPT-5) ----------
-function mapMsgForResponses(m) {
-  const toText = (x) =>
-    typeof x === "string" ? x : (x?.text ?? JSON.stringify(x));
+// ---------- Responses helpers (GPT-5) ----------
+function collapseResponsesText(resp) {
+  if (!resp) return "";
+  if (typeof resp.output_text === "string" && resp.output_text) return resp.output_text;
+  try {
+    const chunks = [];
+    for (const item of resp.output || []) {
+      for (const c of item?.content || []) {
+        if (typeof c?.text === "string") chunks.push(c.text);
+        else if (typeof c?.output_text === "string") chunks.push(c.output_text);
+      }
+    }
+    return chunks.join("");
+  } catch { return ""; }
+}
 
-  // Always work with an array of parts
+// Build a message compatible with Responses API, parameterised by the input type.
+// Some accounts/SDKs still expect {type:"text"} instead of {type:"input_text"}.
+function mapMsgForResponses(m, useInputText = true) {
+  const INPUT_TEXT = useInputText ? "input_text" : "text";
+
+  const toText = (x) => (typeof x === "string" ? x : (x?.text ?? JSON.stringify(x)));
+
   const partsIn = Array.isArray(m.content)
     ? m.content
-    : [{ type: "input_text", text: toText(m.content) }];
+    : [{ type: INPUT_TEXT, text: toText(m.content) }];
 
   const partsOut = partsIn.map((p) => {
-    // Allow both shapes for images: { image_url: "..." } or { image_url: { url: "..." } }
     if (p?.type === "image_url" && p?.image_url) {
       const url = typeof p.image_url === "string" ? p.image_url : p.image_url.url;
       return { type: "input_image", image_url: url };
     }
-
-    // Normalise any text-like part to Responses API's input_text
-    const txt =
-      typeof p === "string" ? p :
-      (p.text ?? p.content ?? toText(p));
-    return { type: "input_text", text: String(txt ?? "") };
+    const txt = typeof p === "string" ? p : (p.text ?? p.content ?? toText(p));
+    return { type: INPUT_TEXT, text: String(txt ?? "") };
   });
 
   return { role: m.role, content: partsOut };
 }
 
-
-// ---------- OpenAI wrapper ----------
 const GPT5_RE = /^gpt-5/i;
 
 async function safeChatCompletion({
@@ -99,22 +109,44 @@ async function safeChatCompletion({
 }) {
   const isGpt5 = GPT5_RE.test(model);
 
-  // GPT-5 models -> Responses API
   if (isGpt5) {
-    const input = messages.map(mapMsgForResponses);
-    const call = (mdl, outTok) =>
-      openai.responses.create({ model: mdl, input, temperature, max_output_tokens: outTok });
+    // Helper that tries 'input_text' first, then retries with 'text' on 400 schema errors.
+    const callResponsesCompat = async (mdl, outTok) => {
+      const tryOnce = async (useInputText) => {
+        const input = messages.map((m) => mapMsgForResponses(m, useInputText));
+        return openai.responses.create({ model: mdl, input, temperature, max_output_tokens: outTok });
+      };
+
+      try {
+        return await tryOnce(true); // prefer input_text
+      } catch (e) {
+        const msg = String(e?.message || "");
+        const shouldRetry =
+          /unsupported parameter|invalid value|400/i.test(msg) ||
+          /invalid_request_error/i.test(JSON.stringify(e));
+
+        await dbg("responses_error", {
+          tried: mdl,
+          message: msg.slice(0, 300),
+          status: e?.status ?? null
+        });
+
+        if (!shouldRetry) throw e;
+
+        await dbg("responses_retry_compat", { reason: "switch_to_text_type" });
+        return await tryOnce(false); // retry with type: "text"
+      }
+    };
 
     try {
-      let resp = await call(model, maxTokens);
+      let resp = await callResponsesCompat(model, maxTokens);
       let text = collapseResponsesText(resp).trim();
       await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
 
-      // retry once with a bump if empty/length-limited
       if (!text) {
         const bump = Math.min(maxTokens + 200, 800);
         await dbg("model_retry_length", { bump });
-        resp = await call(model, bump);
+        resp = await callResponsesCompat(model, bump);
         text = collapseResponsesText(resp).trim();
         await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
       }
@@ -127,13 +159,17 @@ async function safeChatCompletion({
     } catch (err) {
       const emsg = String(err?.message || err || "");
       const is503 = /503|temporar(il)?y unavailable/i.test(emsg);
-      await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
+      await dbg("model_fallback", {
+        tried: model,
+        error: `Error: ${emsg}`,
+        status: err?.status ?? null
+      });
 
       if (STRICT_GPT5) {
         // snapshot
         if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
           try {
-            const r2 = await call(CHAT_SNAPSHOT_FALLBACK, maxTokens);
+            const r2 = await callResponsesCompat(CHAT_SNAPSHOT_FALLBACK, maxTokens);
             const t2 = collapseResponsesText(r2).trim();
             return { choices: [{ message: { content: t2 }, finish_reason: t2 ? "stop" : "length" }] };
           } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
@@ -141,7 +177,7 @@ async function safeChatCompletion({
         // nano (still GPT-5)
         if (model !== "gpt-5-nano") {
           try {
-            const r3 = await call("gpt-5-nano", maxTokens);
+            const r3 = await callResponsesCompat("gpt-5-nano", maxTokens);
             const t3 = collapseResponsesText(r3).trim();
             return { choices: [{ message: { content: t3 }, finish_reason: t3 ? "stop" : "length" }] };
           } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
@@ -149,52 +185,43 @@ async function safeChatCompletion({
         throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
       }
 
-      // non-strict: fall back to a healthy 4o-mini only for service hiccups
+      // Non-strict: allow 4o-mini for reliability
       if (is503) {
         return await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages,
-          temperature: 0.2,
-          max_tokens: maxTokens,
+          model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens,
         });
       }
 
-      // try snapshot -> nano -> 4o-mini
+      // snapshot -> nano -> 4o-mini
       if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
         try {
-          const r5 = await call(CHAT_SNAPSHOT_FALLBACK, maxTokens);
+          const r5 = await callResponsesCompat(CHAT_SNAPSHOT_FALLBACK, maxTokens);
           const t5 = collapseResponsesText(r5).trim();
           return { choices: [{ message: { content: t5 }, finish_reason: t5 ? "stop" : "length" }] };
         } catch {}
       }
       try {
-        const r6 = await call("gpt-5-nano", maxTokens);
+        const r6 = await callResponsesCompat("gpt-5-nano", maxTokens);
         const t6 = collapseResponsesText(r6).trim();
         return { choices: [{ message: { content: t6 }, finish_reason: t6 ? "stop" : "length" }] };
       } catch {}
 
       return await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages,
-        temperature: 0.2,
-        max_tokens: maxTokens,
+        model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens,
       });
     }
   }
 
-  // Non-GPT-5 -> Chat Completions (no response_format here)
+  // Non-GPT-5 -> Chat Completions
   try {
     return await openai.chat.completions.create({
       model, messages, temperature, max_tokens: maxTokens,
     });
   } catch (err) {
     const emsg = String(err?.message || err || "");
-    await dbg("model_fallback", { tried: model, error: `Error: ${emsg}` });
+    await dbg("model_fallback", { tried: model, error: `Error: ${emsg}`, status: err?.status ?? null });
     return await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-      temperature: 0.2,
-      max_tokens: maxTokens,
+      model: "gpt-4o-mini", messages, temperature: 0.2, max_tokens: maxTokens,
     });
   }
 }
@@ -277,7 +304,7 @@ async function sendDirect({ channel, to, body }) {
   }
 }
 
-// Try direct (if allowed). If it fails (or not allowed), immediately answer with TwiML.
+// Try direct (if allowed). If it fails (or not allowed), answer with TwiML.
 async function respondDirectOrTwiml(res, { channel, to, body, allowDirect }) {
   let usedDirect = false, ok = false;
   if (allowDirect) { usedDirect = true; ok = await sendDirect({ channel, to, body }); }
@@ -723,7 +750,7 @@ export default async function handler(req, res) {
     let ProfileName = p.get("ProfileName"); let MediaUrl0 = p.get("MediaUrl0"); let MediaContentType0 = p.get("MediaContentType0");
     let ChannelOverride = null;
 
-    // JSON test fallback
+    // JSON test fallback (useful for local testing)
     if ((!Body && !From) && raw && raw.trim().startsWith("{")) {
       try {
         const j = JSON.parse(raw);
@@ -748,10 +775,14 @@ export default async function handler(req, res) {
     await dbg("webhook_in", { channel, from, body, numMedia }, null);
 
     // Guards
-    if (!from) { res.setHeader("Content-Type","text/xml"); return res.status(200).send("<Response><Message>Missing sender</Message></Response>"); }
+    if (!from) {
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send("<Response><Message>Missing sender</Message></Response>");
+    }
     if (!body && numMedia === 0) {
       const msg = "I received an empty message. Please send your question as text.";
-      res.setHeader("Content-Type","text/xml"); return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
+      res.setHeader("Content-Type","text/xml");
+      return res.status(200).send(`<Response><Message>${escapeXml(msg)}</Message></Response>`);
     }
     if (channel === "sms" && numMedia > 0) {
       res.setHeader("Content-Type","text/xml");
