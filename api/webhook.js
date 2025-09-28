@@ -158,7 +158,6 @@ async function safeChatCompletion({
           messages,
           temperature: 0.2,
           max_tokens: maxTokens,
-          response_format: { type: "text" },
         });
       }
 
@@ -181,15 +180,14 @@ async function safeChatCompletion({
         messages,
         temperature: 0.2,
         max_tokens: maxTokens,
-        response_format: { type: "text" },
       });
     }
   }
 
-  // Non-GPT-5 -> Chat Completions
+  // Non-GPT-5 -> Chat Completions (no response_format here)
   try {
     return await openai.chat.completions.create({
-      model, messages, temperature, max_tokens: maxTokens, response_format: { type: "text" },
+      model, messages, temperature, max_tokens: maxTokens,
     });
   } catch (err) {
     const emsg = String(err?.message || err || "");
@@ -199,7 +197,6 @@ async function safeChatCompletion({
       messages,
       temperature: 0.2,
       max_tokens: maxTokens,
-      response_format: { type: "text" },
     });
   }
 }
