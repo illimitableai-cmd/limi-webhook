@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set to gpt-5-mini to use mini
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5-nano"; // set OPENAI_CHAT_MODEL=gpt-5-mini in Vercel to use mini
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -70,8 +70,8 @@ function collapseResponsesText(resp) {
 async function gpt5Reply(userMsg) {
   const baseParams = {
     model: CHAT_MODEL,
-    instructions: "You are a concise assistant. Always produce a short, direct text answer. Output text only.",
-    response_format: { type: "text" }, // prefer text output
+    instructions: "You are a concise assistant. Always produce a short, direct text answer.",
+    text: { format: "plain" }, // ✅ correct parameter
     max_output_tokens: 220
   };
 
@@ -105,7 +105,7 @@ async function gpt5Reply(userMsg) {
   // Retry once with stricter prompt
   const params2 = {
     ...baseParams,
-    instructions: "Answer the user's question directly in 1–2 short sentences. Return PLAIN TEXT only.",
+    instructions: "Answer the user's question directly in 1–2 short sentences. Plain text only.",
     input: [
       { role: "system", content: [{ type: "input_text", text: "Return a direct answer as plain text." }]},
       { role: "user",   content: [{ type: "input_text", text: userMsg }]},
