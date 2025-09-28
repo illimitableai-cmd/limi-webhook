@@ -52,20 +52,60 @@ function smsNumber(s="") {
   return v;
 }
 
-/* ---------------- Robust extractor for Responses API ---------------- */
-function extractResponseText(resp) {
-  if (!resp) return "";
-  if (typeof resp.output_text === "string" && resp.output_text) return resp.output_text.trim();
+/* ---------------- Deep extraction helpers ---------------- */
+// Safely stringify a small slice for logs
+function safeSlice(obj, n = 800) {
+  try { return JSON.stringify(obj).slice(0, n); } catch { return String(obj).slice(0, n); }
+}
 
-  const chunks = [];
+// Find the first JSON object in the output (content blocks often carry it under .json)
+function deepFindJson(resp) {
+  let found = null;
+  const visit = (node) => {
+    if (!node || typeof node !== "object" || found) return;
+    // explicit json field
+    if (node.json && typeof node.json === "object") { found = node.json; return; }
+    // blocks whose type hints JSON
+    if (typeof node.type === "string" && /json/i.test(node.type)) {
+      if (node.json && typeof node.json === "object") { found = node.json; return; }
+      // sometimes the JSON lives in "text" as a string
+      if (typeof node.text === "string") {
+        try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {}
+      }
+    }
+    // generic leaf parse
+    if (typeof node.text === "string" && node.text.trim().startsWith("{")) {
+      try { const j = JSON.parse(node.text); if (j && typeof j === "object") { found = j; return; } } catch {}
+    }
+    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
+    for (const k of Object.keys(node)) visit(node[k]);
+  };
+  if (resp?.output) visit(resp.output);
+  else visit(resp);
+  return found;
+}
+
+// Collect visible text from any known shapes
+function deepFindText(resp) {
+  const out = [];
   const visit = (node) => {
     if (!node || typeof node !== "object") return;
 
-    // common text fields
-    if (typeof node.text === "string" && node.text) chunks.push(node.text);
-    if (typeof node.output_text === "string" && node.output_text) chunks.push(node.output_text);
+    // common leaves
+    if (typeof node.output_text === "string" && node.output_text) out.push(node.output_text);
+    if (typeof node.text === "string" && node.text) out.push(node.text);
 
-    // arrays / nested content
+    // sometimes text is wrapped: { text: { value: "..." } }
+    if (node.text && typeof node.text === "object" && typeof node.text.value === "string") {
+      out.push(node.text.value);
+    }
+
+    // JSON object containing final
+    if (node.json && typeof node.json === "object" && typeof node.json.final === "string") {
+      out.push(node.json.final);
+    }
+
+    // Walk arrays and nested shapes
     if (Array.isArray(node)) { for (const it of node) visit(it); return; }
     if (Array.isArray(node.content)) { for (const it of node.content) visit(it); }
     if (node.assistant_response && typeof node.assistant_response === "object") visit(node.assistant_response);
@@ -75,26 +115,15 @@ function extractResponseText(resp) {
       if (v && typeof v === "object") visit(v);
     }
   };
-  if (Array.isArray(resp.output)) visit(resp.output);
-  if (!chunks.length && typeof resp === "object") visit(resp);
 
-  return chunks.join("").trim();
+  if (Array.isArray(resp?.output)) visit(resp.output);
+  else visit(resp);
+  return out.join("").trim();
 }
-function summariseContentTypes(resp) {
-  const counts = {};
-  const visit = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
-    if (node.type) counts[node.type] = (counts[node.type] || 0) + 1;
-    if (Array.isArray(node.content)) for (const it of node.content) visit(it);
-    if (node.assistant_response) visit(node.assistant_response);
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (v && typeof v === "object") visit(v);
-    }
-  };
-  if (resp && typeof resp === "object") visit(resp);
-  return counts;
+
+function extractFinalTag(s="") {
+  const m = s.match(/<final>([\s\S]*?)<\/final>/i);
+  return m ? m[1].trim() : "";
 }
 
 /* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
@@ -102,11 +131,6 @@ export async function gpt5Reply(userMsg) {
   const INSTRUCTIONS =
     "Return ONLY the final answer. Be direct and clear in 1–4 sentences. " +
     "Wrap the final answer like this: <final>...your answer...</final>.";
-
-  const extractFinal = (s="") => {
-    const m = s.match(/<final>([\s\S]*?)<\/final>/i);
-    return m ? m[1].trim() : "";
-  };
 
   async function callWithTimeout(params, dbgLabel) {
     await dbg(dbgLabel + "_request", {
@@ -124,17 +148,17 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // Attempt 1 — JSON via top-level text.format (validator needs the word "json/JSON" in input)
+  // --- Attempt 1: JSON via text.format (requires the word "json/JSON" in input)
   const paramsJson = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
-    text: { format: { type: "json_object" } }, // ✅ correct for Responses API
+    text: { format: { type: "json_object" } },
     instructions: "You are an SMS assistant. Output JSON only.",
     input: [
       {
         role: "system",
         content: [
-          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." } // contains “JSON”
+          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." }
         ]
       },
       { role: "user", content: [{ type: "input_text", text: userMsg }]}
@@ -147,25 +171,38 @@ export async function gpt5Reply(userMsg) {
     return "Sorry—took too long to respond.";
   }
   if (!r?.__error) {
-    const all = extractResponseText(r);
-    let final = "";
-    try {
-      const start = all.indexOf("{"); const end = all.lastIndexOf("}");
-      const raw = (start >= 0 && end >= 0) ? all.slice(start, end + 1) : all;
-      const j = JSON.parse(raw);
-      if (j && typeof j.final === "string") final = j.final.trim();
-    } catch { /* ignore and continue */ }
-    await dbg("gpt5_reply", {
-      attempt: "jsonfmt", model: r?.model, usage: r?.usage,
-      len: (final||"").length, types: summariseContentTypes(r),
-      preview: (final||"").slice(0,160)
+    // extra debug: log the first output item structure
+    const output0 = Array.isArray(r.output) ? r.output[0] : null;
+    await dbg("gpt5_jsonfmt_shape", {
+      output0_shape: safeSlice(output0, 1000),
+      output0_keys: output0 ? Object.keys(output0) : []
     });
-    if (final) return final;
+
+    // Prefer JSON blocks
+    const j = deepFindJson(r);
+    if (j && typeof j.final === "string" && j.final.trim()) {
+      const final = j.final.trim();
+      await dbg("gpt5_reply", {
+        attempt: "jsonfmt", model: r?.model, usage: r?.usage,
+        len: final.length
+      });
+      return final;
+    }
+
+    // Fallback: any visible text we can find
+    const all = deepFindText(r);
+    if (all) {
+      await dbg("gpt5_reply", {
+        attempt: "jsonfmt_textfallback", model: r?.model, usage: r?.usage,
+        len: all.length
+      });
+      return all;
+    }
   } else {
     await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
   }
 
-  // Attempt 2 — items + <final> contract (plain text, no tools)
+  // --- Attempt 2: items + <final> (plain text)
   const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
@@ -178,19 +215,24 @@ export async function gpt5Reply(userMsg) {
     return "Sorry—took too long to respond.";
   }
   if (!r?.__error) {
-    const all = extractResponseText(r);
-    const final = extractFinal(all) || all;
+    const output0 = Array.isArray(r.output) ? r.output[0] : null;
+    await dbg("gpt5_items_shape", {
+      output0_shape: safeSlice(output0, 1000),
+      output0_keys: output0 ? Object.keys(output0) : []
+    });
+
+    let text = deepFindText(r);
+    const final = extractFinalTag(text) || text;
     await dbg("gpt5_reply", {
       attempt: "items", model: r?.model, usage: r?.usage,
-      len: (final||"").length, types: summariseContentTypes(r),
-      preview: (final||"").slice(0,160)
+      len: (final||"").length
     });
     if (final) return final;
   } else {
     await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // Attempt 3 — plain string + <final> (no tools)
+  // --- Attempt 3: plain string + <final> (no tools)
   const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
@@ -203,12 +245,17 @@ export async function gpt5Reply(userMsg) {
     return "Sorry—took too long to respond.";
   }
   if (!r?.__error) {
-    const all = extractResponseText(r);
-    const final = extractFinal(all) || all;
+    const output0 = Array.isArray(r.output) ? r.output[0] : null;
+    await dbg("gpt5_string_shape", {
+      output0_shape: safeSlice(output0, 1000),
+      output0_keys: output0 ? Object.keys(output0) : []
+    });
+
+    let text = deepFindText(r);
+    const final = extractFinalTag(text) || text;
     await dbg("gpt5_reply_retry", {
       attempt: "string", model: r?.model, usage: r?.usage,
-      len: (final||"").length, types: summariseContentTypes(r),
-      preview: (final||"").slice(0,160)
+      len: (final||"").length
     });
     if (final) return final;
   } else {
