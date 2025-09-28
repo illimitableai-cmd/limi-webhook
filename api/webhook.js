@@ -126,27 +126,26 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // Attempt 1 — Force JSON output; include the literal word "JSON" in *input messages*
+  // --- Attempt 1: JSON (validator needs the word "JSON" in input messages)
   const paramsJson = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
-    // Even though we set instructions, the validator for text.format checks input messages,
-    // so we also add a system primer in the input that contains "JSON".
     instructions:
       "Respond ONLY as a single JSON object with this exact shape: {\"final\":\"...\"}. " +
       "Do not include any other keys, markdown, or text outside JSON. " +
       "Put the final human-facing answer in the \"final\" field.",
-    text: { format: "json_object" }, // request visible JSON text channel
+    tools: [{ type: "text", format: { type: "json_object" } }], // ✅ correct shape
     input: [
       {
         role: "system",
         content: [
-          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object." }
+          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object." } // ✅ contains “JSON”
         ]
       },
       { role: "user", content: [{ type: "input_text", text: userMsg }]}
     ],
   };
+
   let r = await callWithTimeout(paramsJson, "gpt5_jsonfmt");
   if (r?.__timeout) {
     await dbg("gpt5_timeout", { attempt: "jsonfmt", ms: LLM_TIMEOUT_MS });
@@ -160,7 +159,7 @@ export async function gpt5Reply(userMsg) {
       const raw = (start >= 0 && end >= 0) ? all.slice(start, end + 1) : all;
       const j = JSON.parse(raw);
       if (j && typeof j.final === "string") final = j.final.trim();
-    } catch { /* ignore and continue */ }
+    } catch { /* swallow */ }
     await dbg("gpt5_reply", {
       attempt: "jsonfmt", model: r?.model, usage: r?.usage,
       len: (final||"").length, types: summariseContentTypes(r),
@@ -168,14 +167,14 @@ export async function gpt5Reply(userMsg) {
     });
     if (final) return final;
   } else {
-    // DO NOT return early on any JSON-format error; fall through to plain text attempts
     await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
   }
 
-  // Attempt 2 — items with input_text (no text.format) + <final> contract
+  // --- Attempt 2: normal text via items + <final> contract
   const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
+    tools: [{ type: "text" }], // ✅ ensure text tool is present
     instructions: INSTRUCTIONS,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
@@ -197,10 +196,11 @@ export async function gpt5Reply(userMsg) {
     await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // Attempt 3 — plain string input (minimal shape) + <final> contract
+  // --- Attempt 3: plain string input + text tool
   const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
+    tools: [{ type: "text" }], // ✅ ensure text tool is present
     instructions: INSTRUCTIONS,
     input: `User: ${userMsg}\n\n<final>`,
   };
