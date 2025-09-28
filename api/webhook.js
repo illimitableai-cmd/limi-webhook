@@ -77,13 +77,14 @@ function collapseResponsesText(resp) {
   } catch { return ""; }
 }
 
-// Always build Responses API messages using input_text / input_image (strict).
+// Build a message compatible with Responses API using { type: "text" } for input,
+// and { type: "input_image" } for images.
 function mapMsgForResponses(m) {
   const toText = (x) => (typeof x === "string" ? x : (x?.text ?? JSON.stringify(x)));
 
   const partsIn = Array.isArray(m.content)
     ? m.content
-    : [{ type: "input_text", text: toText(m.content) }];
+    : [{ type: "text", text: toText(m.content) }];
 
   const partsOut = partsIn.map((p) => {
     if (p?.type === "image_url" && p?.image_url) {
@@ -91,7 +92,7 @@ function mapMsgForResponses(m) {
       return { type: "input_image", image_url: url };
     }
     const txt = typeof p === "string" ? p : (p.text ?? p.content ?? toText(p));
-    return { type: "input_text", text: String(txt ?? "") };
+    return { type: "text", text: String(txt ?? "") };
   });
 
   return { role: m.role, content: partsOut };
@@ -102,107 +103,116 @@ const GPT5_RE = /^gpt-5/i;
 async function safeChatCompletion({
   messages,
   model = CHAT_MODEL,
+  // IMPORTANT: temperature is NOT supported with GPT-5 models via Responses API.
+  // We'll only use it on non-GPT-5 (Chat Completions) calls.
   temperature = 0.2,
   maxTokens = 220,
 }) {
   const isGpt5 = GPT5_RE.test(model);
 
   if (isGpt5) {
-    const input = messages.map(mapMsgForResponses);
+    // Responses API call (no 'temperature' param)
+    const callResponses = async (mdl, outTok) => {
+      const input = messages.map(mapMsgForResponses);
+      const params = { model: mdl, input, max_output_tokens: outTok };
+      return openai.responses.create(params);
+    };
+
     try {
-      const resp = await openai.responses.create({
-        model,
-        input,
-        temperature,
-        max_output_tokens: maxTokens,
-      });
-      const text = collapseResponsesText(resp).trim();
-      await dbg("responses_ok", { model: resp?.model, len: text.length, usage: resp?.usage || null });
+      let resp = await callResponses(model, maxTokens);
+      let text = collapseResponsesText(resp).trim();
+      await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
+
+      // retry once with a larger token budget if empty/too short
+      if (!text) {
+        const bump = Math.min(maxTokens + 200, 800);
+        await dbg("model_retry_length", { bump });
+        resp = await callResponses(model, bump);
+        text = collapseResponsesText(resp).trim();
+        await dbg("model_meta", { model: resp?.model, len: text.length, usage: resp?.usage || null });
+      }
+
       return {
         choices: [{ message: { content: text }, finish_reason: text ? "stop" : "length" }],
         model: resp?.model,
         usage: resp?.usage,
       };
     } catch (err) {
-      // Log *rich* error details; do not fall back.
-      await dbg("responses_error", {
-        model,
-        status: err?.status ?? null,
-        message: String(err?.message || err),
-        body: err?.response?.data ?? null,
+      const emsg = String(err?.message || err || "");
+      const is503 = /503|temporar(il)?y unavailable/i.test(emsg);
+      await dbg("model_fallback", { tried: model, error: `Error: ${emsg}`, status: err?.status ?? null });
+
+      if (STRICT_GPT5) {
+        // Try snapshot then nano (still GPT-5 family)
+        if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
+          try {
+            const r2 = await callResponses(CHAT_SNAPSHOT_FALLBACK, maxTokens);
+            const t2 = collapseResponsesText(r2).trim();
+            return { choices: [{ message: { content: t2 }, finish_reason: t2 ? "stop" : "length" }] };
+          } catch (e2) { await dbg("model_fallback", { tried: CHAT_SNAPSHOT_FALLBACK, error: String(e2) }); }
+        }
+        if (model !== "gpt-5-nano") {
+          try {
+            const r3 = await callResponses("gpt-5-nano", maxTokens);
+            const t3 = collapseResponsesText(r3).trim();
+            return { choices: [{ message: { content: t3 }, finish_reason: t3 ? "stop" : "length" }] };
+          } catch (e3) { await dbg("model_fallback", { tried: "gpt-5-nano", error: String(e3) }); }
+        }
+        // hard fail in strict mode (no 4o fallbacks)
+        throw new Error(is503 ? "gpt5_unavailable_503" : "gpt5_error");
+      }
+
+      // Non-strict fallback path (kept for completeness)
+      if (is503) {
+        return await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages,
+          temperature: 0.2,
+          max_tokens: maxTokens,
+        });
+      }
+      if (CHAT_SNAPSHOT_FALLBACK && CHAT_SNAPSHOT_FALLBACK !== model) {
+        try {
+          const r5 = await callResponses(CHAT_SNAPSHOT_FALLBACK, maxTokens);
+          const t5 = collapseResponsesText(r5).trim();
+          return { choices: [{ message: { content: t5 }, finish_reason: t5 ? "stop" : "length" }] };
+        } catch {}
+      }
+      try {
+        const r6 = await callResponses("gpt-5-nano", maxTokens);
+        const t6 = collapseResponsesText(r6).trim();
+        return { choices: [{ message: { content: t6 }, finish_reason: t6 ? "stop" : "length" }] };
+      } catch {}
+
+      return await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        temperature: 0.2,
+        max_tokens: maxTokens,
       });
-      throw new Error("gpt5_error");
     }
   }
 
-  // Non-GPT-5: no fallback either
+  // Non-GPT-5 -> Chat Completions (temperature allowed here)
   try {
     return await openai.chat.completions.create({
-      model, messages, temperature, max_tokens: maxTokens,
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
     });
   } catch (err) {
-    await dbg("chatcompletions_error", {
-      model, status: err?.status ?? null, message: String(err?.message || err),
+    const emsg = String(err?.message || err || "");
+    await dbg("model_fallback", { tried: model, error: `Error: ${emsg}`, status: err?.status ?? null });
+    return await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      temperature: 0.2,
+      max_tokens: maxTokens,
     });
-    throw new Error("non_gpt5_error");
   }
 }
 
-function watchdog(promise, ms, onTimeoutMsg = "Sorry—took too long to respond.") {
-  let t;
-  const timeout = new Promise((r) => { t = setTimeout(() => r({ __timeout: true, content: onTimeoutMsg }), ms); });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
-}
-
-// ---------- “Answer the question” helpers ----------
-function looksLikeNonAnswer(txt = "") {
-  const t = (txt || "").toLowerCase().trim();
-  if (!t) return true;
-  return /(sorry|can't|cannot|couldn'?t|unsure|not (sure|certain)|don'?t know|no idea)/.test(t);
-}
-async function forceAnswer(userMsg, priorSummary = "") {
-  const sys = [
-    "You are Limi, a concise UK-English SMS assistant.",
-    "You MUST directly answer the user's question in 1–3 short sentences.",
-    "If it's a 'how many' question, reply with a concrete number or best estimate (e.g., 'about 60–70'), then 3–6 words of context.",
-    "Avoid hedging or apologies. No disclaimers. No 'as an AI'.",
-    "If the question is ambiguous, pick the most likely interpretation and state the answer.",
-    priorSummary ? `Conversation so far: ${priorSummary.slice(0, 600)}` : ""
-  ].filter(Boolean).join("\n");
-
-  const c = await safeChatCompletion({
-    model: CHAT_MODEL, temperature: 0.1, maxTokens: 220,
-    messages: [{ role: "system", content: sys }, { role: "user", content: userMsg }]
-  });
-
-  return (c.choices?.[0]?.message?.content || "").trim();
-}
-async function expandIfShort({ reply, userMsg, priorSummary, minChars = MIN_REPLY_CHARS, budgetMs = Math.max(1200, Math.floor(LLM_TIMEOUT_MS / 2)) }) {
-  let base = (reply || "").trim();
-  if (base.length >= minChars && !looksLikeNonAnswer(base)) return base;
-
-  // Pass 2 (bounded)
-  let forced = "";
-  const f = await watchdog(forceAnswer(userMsg, priorSummary), budgetMs, "");
-  if (typeof f === "string") forced = f.trim();
-  if (forced.length >= minChars && !looksLikeNonAnswer(forced)) return forced;
-
-  // Pass 3 (bounded)
-  const sys = "Rewrite so it DIRECTLY answers the user's question in 1–3 concise UK-English sentences. No apologies.";
-  const usr = `User: ${userMsg}\n\nDraft reply:\n${forced || base}\n\nRewrite (>= ${minChars} chars):`;
-  try {
-    const c = await watchdog(
-      safeChatCompletion({ model: CHAT_MODEL, messages: [{ role: "system", content: sys }, { role: "user", content: usr }], maxTokens: 220 }),
-      Math.max(800, Math.floor(budgetMs / 2)),
-      ""
-    );
-    const improved = (c?.choices?.[0]?.message?.content || c?.content || "").trim();
-    if (improved.length >= minChars && !looksLikeNonAnswer(improved)) return improved;
-    return improved || forced || base || "I’ll answer in a moment.";
-  } catch {
-    return forced || base || "I’ll answer in a moment.";
-  }
-}
 
 // ---------- Twilio send helper ----------
 async function sendDirect({ channel, to, body }) {
