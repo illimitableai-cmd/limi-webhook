@@ -18,7 +18,7 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // full GPT-5 (rolling alias)
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5"; // rolling GPT-5
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
@@ -53,62 +53,50 @@ function smsNumber(s="") {
 }
 
 /* ---------------- Robust extractor for Responses API ---------------- */
-/** Deeply collect any visible text from modern Responses payloads.
- *  Handles shapes like:
- *   - resp.output_text (string)
- *   - resp.output[*].content[*].text / .output_text
- *   - resp.output[*].content[*].assistant_response.content[*].text
- *   - any nested .content arrays
- */
+// Deeply collect any visible text from modern Responses payloads.
 function extractResponseText(resp) {
   if (!resp) return "";
-
   const chunks = [];
 
   const visit = (node) => {
     if (!node || typeof node !== "object") return;
 
-    // direct strings:
-    if (typeof node.output_text === "string" && node.output_text) {
-      chunks.push(node.output_text);
-    }
-    if (typeof node.text === "string" && node.text) {
-      chunks.push(node.text);
-    }
+    if (typeof node.output_text === "string" && node.output_text) chunks.push(node.output_text);
+    if (typeof node.text === "string" && node.text) chunks.push(node.text);
 
-    // arrays to walk
-    if (Array.isArray(node)) {
-      for (const it of node) visit(it);
-      return;
-    }
+    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
+    if (Array.isArray(node.content)) { for (const it of node.content) visit(it); }
+    if (node.assistant_response && typeof node.assistant_response === "object") { visit(node.assistant_response); }
 
-    // content arrays at any nesting level
-    if (Array.isArray(node.content)) {
-      for (const it of node.content) visit(it);
-    }
-
-    // some snapshots wrap inside assistant_response { content: [...] }
-    if (node.assistant_response && typeof node.assistant_response === "object") {
-      visit(node.assistant_response);
-    }
-
-    // catch-all: walk all properties (safe, but shallow-copies avoided)
     for (const k of Object.keys(node)) {
       const v = node[k];
       if (v && typeof v === "object") visit(v);
     }
   };
 
-  // top-level helpers first
-  if (typeof resp.output_text === "string" && resp.output_text) {
-    chunks.push(resp.output_text);
-  }
+  if (typeof resp.output_text === "string" && resp.output_text) chunks.push(resp.output_text);
   if (Array.isArray(resp.output)) visit(resp.output);
-
-  // as a last resort, walk whole resp (covers rare shapes)
-  if (chunks.length === 0) visit(resp);
+  if (!chunks.length) visit(resp);
 
   return chunks.join("").trim();
+}
+
+// Summarise content types present (for debugging shapes without dumping huge payloads)
+function summariseContentTypes(resp) {
+  const counts = {};
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
+    if (node.type) counts[node.type] = (counts[node.type] || 0) + 1;
+    if (Array.isArray(node.content)) for (const it of node.content) visit(it);
+    if (node.assistant_response) visit(node.assistant_response);
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (v && typeof v === "object") visit(v);
+    }
+  };
+  if (resp && typeof resp === "object") visit(resp);
+  return counts;
 }
 
 /* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
@@ -138,52 +126,82 @@ export async function gpt5Reply(userMsg) {
     });
   }
 
-  // Attempt 1 — items with input_text (widely compatible)
-  const p1 = await callWithTimeout({
+  // Attempt 1 — explicitly request text channel (OBJECT form)
+  const paramsTextFmt = {
+    model: CHAT_MODEL,                // e.g. "gpt-5"
+    max_output_tokens: 300,
+    instructions: INSTRUCTIONS,
+    text: { format: { type: "text" } },   // <-- critical for some GPT-5 snapshots
+    input: [
+      { role: "user", content: [{ type: "input_text", text: userMsg }] }
+    ],
+  };
+
+  let r = await callWithTimeout(paramsTextFmt, "gpt5_textfmt");
+  if (r?.__timeout) {
+    await dbg("gpt5_timeout", { attempt: "textfmt", ms: LLM_TIMEOUT_MS });
+    return "Sorry—took too long to respond.";
+  }
+  if (r?.__error) {
+    const msg = String(r.__error?.message || r.__error);
+    await dbg("gpt5_error", { attempt: "textfmt", message: msg });
+    // Only fall through if the error complains about text/format params
+    if (!/Unsupported parameter: 'text'|Invalid.*text\.format|Unknown parameter: 'text'/i.test(msg)) {
+      return "Model error: " + msg;
+    }
+  } else {
+    const text = extractFinal(extractResponseText(r)) || extractResponseText(r);
+    await dbg("gpt5_reply", {
+      model: r?.model, usage: r?.usage, len: (text||"").length,
+      types: summariseContentTypes(r), preview: (text||"").slice(0,160)
+    });
+    if (text) return text;
+  }
+
+  // Attempt 2 — items with input_text (no text.format)
+  const paramsItems = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
     instructions: INSTRUCTIONS,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
-  }, "gpt5A");
-
-  if (p1?.__timeout) {
-    await dbg("gpt5_timeout", { attempt: "A", ms: LLM_TIMEOUT_MS });
+  };
+  r = await callWithTimeout(paramsItems, "gpt5_items");
+  if (r?.__timeout) {
+    await dbg("gpt5_timeout", { attempt: "items", ms: LLM_TIMEOUT_MS });
     return "Sorry—took too long to respond.";
   }
-  if (!p1?.__error) {
-    let text1 = extractResponseText(p1);
-    const between = extractFinal(text1);
-    if (between) text1 = between;
+  if (!r?.__error) {
+    const text = extractFinal(extractResponseText(r)) || extractResponseText(r);
     await dbg("gpt5_reply", {
-      model: p1?.model, usage: p1?.usage, len: (text1 || "").length, preview: (text1 || "").slice(0,160)
+      model: r?.model, usage: r?.usage, len: (text||"").length,
+      types: summariseContentTypes(r), preview: (text||"").slice(0,160)
     });
-    if (text1) return text1;
+    if (text) return text;
   } else {
-    await dbg("gpt5_error", { attempt: "A", message: String(p1.__error?.message || p1.__error) });
+    await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
   }
 
-  // Attempt 2 — plain string input (some snapshots prefer minimal shape)
-  const p2 = await callWithTimeout({
+  // Attempt 3 — plain string input (minimal shape)
+  const paramsString = {
     model: CHAT_MODEL,
     max_output_tokens: 300,
     instructions: INSTRUCTIONS,
     input: `User: ${userMsg}\n\n<final>`,
-  }, "gpt5S");
-
-  if (p2?.__timeout) {
-    await dbg("gpt5_timeout_retry", { attempt: "S" });
+  };
+  r = await callWithTimeout(paramsString, "gpt5_string");
+  if (r?.__timeout) {
+    await dbg("gpt5_timeout_retry", { attempt: "string" });
     return "Sorry—took too long to respond.";
   }
-  if (!p2?.__error) {
-    let text2 = extractResponseText(p2);
-    const between = extractFinal(text2);
-    if (between) text2 = between;
+  if (!r?.__error) {
+    const text = extractFinal(extractResponseText(r)) || extractResponseText(r);
     await dbg("gpt5_reply_retry", {
-      model: p2?.model, usage: p2?.usage, len: (text2 || "").length, preview: (text2 || "").slice(0,160)
+      model: r?.model, usage: r?.usage, len: (text||"").length,
+      types: summariseContentTypes(r), preview: (text||"").slice(0,160)
     });
-    if (text2) return text2;
+    if (text) return text;
   } else {
-    await dbg("gpt5_error_retry", { attempt: "S", message: String(p2.__error?.message || p2.__error) });
+    await dbg("gpt5_error_retry", { attempt: "string", message: String(r.__error?.message || r.__error) });
   }
 
   await dbg("gpt5_empty_after_retry", { model: CHAT_MODEL });
