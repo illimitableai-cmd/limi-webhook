@@ -8,7 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 /** --- ENV ---
  * Required: OPENAI_KEY, TWILIO_SID, TWILIO_AUTH, TWILIO_FROM
  * Optional: TWILIO_WHATSAPP_FROM (format: whatsapp:+447...)
- * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS, SMS_MAX_CHARS, CHAT_MAX_TOKENS
+ * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS, SMS_MAX_CHARS, CHAT_MAX_TOKENS, WATCHDOG_MS
  * For debug logs: SUPABASE_URL, SUPABASE_KEY and a table `debug_logs`
  */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
@@ -19,23 +19,22 @@ const supabase =
     : null;
 
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 6500); // keep well under Twilio 15s
-const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 5500); // beneath Twilio window
+const WATCHDOG_MS = Number(process.env.WATCHDOG_MS || 9000);
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 const MAX_SMS_CHARS = Number(process.env.SMS_MAX_CHARS || 320);
 const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);
 
-/* ---------------- Debug logging ---------------- */
-async function dbg(step, payload) {
+/* ---------------- logging (non-blocking) ---------------- */
+function dbg(step, payload) {
   try { console.log("[dbg]", step, payload); } catch {}
-  try {
-    if (supabase) await supabase.from("debug_logs").insert([{ step, payload }]);
-  } catch (e) {
-    console.log("[dbg-fail]", step, String(e?.message || e));
-  }
+  if (!supabase) return;
+  supabase.from("debug_logs").insert([{ step, payload }]).catch(e =>
+    console.log("[dbg-fail]", step, String(e?.message || e))
+  );
 }
 
-/* ---------------- Small utils ---------------- */
+/* ---------------- utils ---------------- */
 function toXml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -56,11 +55,35 @@ function smsNumber(s="") {
   if (v.startsWith("0")) v = "+44" + v.slice(1);
   return v;
 }
+function extractFinalTag(s="") {
+  const m = s.match(/<final>([\s\S]*?)<\/final>/i);
+  return m ? m[1].trim() : "";
+}
+function deepFindText(resp) {
+  const out = [];
+  const visit = (n) => {
+    if (!n || typeof n !== "object") return;
+    if (typeof n.output_text === "string" && n.output_text) out.push(n.output_text);
+    if (typeof n.text === "string" && n.text) out.push(n.text);
+    if (Array.isArray(n)) { for (const it of n) visit(it); return; }
+    if (Array.isArray(n.content)) for (const it of n.content) visit(it);
+    if (n.assistant_response) visit(n.assistant_response);
+    for (const k of Object.keys(n)) {
+      const v = n[k]; if (v && typeof v === "object") visit(v);
+    }
+  };
+  if (Array.isArray(resp?.output)) visit(resp.output); else visit(resp);
+  return out.join("").trim();
+}
 
-/* ---------------- OpenAI (Chat-first, fast) ---------------- */
-async function gpt5Reply(userMsg) {
+/* ---------------- GPT-5 hedged callers ---------------- */
+// A. Chat Completions with "final only" contract
+function chatFinal(userMsg) {
   const messages = [
-    { role: "system", content: "You are a concise SMS assistant for Limi. Reply in 1–2 short sentences. No preamble, no bullets, no markdown. Keep it friendly and direct." },
+    { role: "system",
+      content:
+        "Return ONLY the final answer. One short friendly sentence. " +
+        "No preamble, no bullets, no markdown, no chain-of-thought." },
     { role: "user", content: userMsg }
   ];
   const req = {
@@ -68,62 +91,99 @@ async function gpt5Reply(userMsg) {
     messages,
     max_completion_tokens: MAX_COMPLETION_TOKENS
   };
-
-  await dbg("gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
+  dbg("gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
 
   const p = openai.chat.completions.create(req);
-  const r = await new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-    p.then((x) => { clearTimeout(t); resolve(x); })
-     .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(""), LLM_TIMEOUT_MS);
+    p.then(r => {
+       clearTimeout(t);
+       const txt = r?.choices?.[0]?.message?.content?.trim() || "";
+       dbg("gpt5_chat_reply", {
+         has_content: !!txt,
+         finish_reason: r?.choices?.[0]?.finish_reason,
+         usage: r?.usage
+       });
+       resolve(txt);
+    }).catch(e => {
+       clearTimeout(t);
+       dbg("gpt5_chat_error", { message: String(e?.message || e) });
+       resolve("");
+    });
   });
-
-  if (r?.__timeout) {
-    await dbg("gpt5_chat_error", { message: "timeout", ms: LLM_TIMEOUT_MS });
-    return "Sorry—couldn’t answer just now.";
-  }
-  if (r?.__error) {
-    await dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error) });
-    return "Sorry—couldn’t answer just now.";
-  }
-
-  const content = r?.choices?.[0]?.message?.content?.trim() || "";
-  await dbg("gpt5_chat_reply", {
-    has_content: !!content,
-    finish_reason: r?.choices?.[0]?.finish_reason,
-    usage: r?.usage
-  });
-  return content || "Sorry—couldn’t answer just now.";
 }
 
-/* ---------------- Twilio send (WA direct) ---------------- */
+// B. Responses API “<final> … </final>” contract
+function responsesFinal(userMsg) {
+  const req = {
+    model: CHAT_MODEL,
+    max_output_tokens: 200,
+    instructions:
+      "Return ONLY the final answer in 1 short sentence. " +
+      "Wrap it exactly like this: <final>your answer</final>.",
+    input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}]
+  };
+  dbg("gpt5_items_request", { model: req.model, input_preview: JSON.stringify(req.input).slice(0,160) });
+
+  const p = openai.responses.create(req);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(""), LLM_TIMEOUT_MS);
+    p.then(r => {
+      clearTimeout(t);
+      const text = deepFindText(r);
+      const final = extractFinalTag(text) || text || "";
+      dbg("gpt5_items_shape", {
+        output0_keys: Array.isArray(r.output) && r.output[0] ? Object.keys(r.output[0]) : [],
+        final_len: final.length
+      });
+      resolve(final.trim());
+    }).catch(e => {
+      clearTimeout(t);
+      dbg("gpt5_items_error", { message: String(e?.message || e) });
+      resolve("");
+    });
+  });
+}
+
+/* Hedge both GPT-5 paths and return the first non-empty string */
+async function gpt5Reply(userMsg) {
+  const [a, b] = await Promise.all([chatFinal(userMsg), responsesFinal(userMsg)]);
+  const txt = (a && a.trim()) || (b && b.trim()) || "";
+  return txt || "Sorry—couldn’t answer just now.";
+}
+
+/* ---------------- WA direct send ---------------- */
 async function sendWhatsApp(to, body) {
   if (!TWILIO_WA_FROM) throw new Error("Missing TWILIO_WHATSAPP_FROM");
   const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
   const r = await twilioClient.messages.create({ from: TWILIO_WA_FROM, to: waTo, body });
-  await dbg("twilio_send_wa_ok", { sid: r.sid, to: waTo });
+  dbg("twilio_send_wa_ok", { sid: r.sid, to: waTo });
   return r;
 }
 
-/* ---------------- Handler ---------------- */
+/* ---------------- Handler with watchdog ---------------- */
 export default async function handler(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+
   try {
     if (req.method !== "POST") { res.status(405).send("Method Not Allowed"); return; }
 
     const raw = await readRawBody(req);
-    let Body=null, From=null, NumMedia=0;
+    let Body=null, From=null, NumMedia=0, Channel=null;
 
     if (raw.trim().startsWith("{")) {
       const j = JSON.parse(raw);
       Body = j.Body ?? j.body ?? "";
       From = j.From ?? j.from ?? "";
-      if (j.channel === "whatsapp" && From && !/^whatsapp:/i.test(From)) From = `whatsapp:${From}`;
+      Channel = j.channel || null;
+      if (Channel === "whatsapp" && From && !/^whatsapp:/i.test(From)) From = `whatsapp:${From}`;
       NumMedia = Number(j.NumMedia || j.numMedia || 0);
     } else {
       const p = new URLSearchParams(raw);
       Body = p.get("Body");
       From = p.get("From");
       NumMedia = Number(p.get("NumMedia") || 0);
+      Channel = /^whatsapp:/i.test(From || "") ? "whatsapp" : "sms";
     }
 
     Body = (Body || "").trim();
@@ -131,42 +191,62 @@ export default async function handler(req, res) {
     const isWhatsApp = /^whatsapp:/i.test(From);
     const cleanFrom = smsNumber(From);
 
-    await dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
+    dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
+
+    // Watchdog: guarantee Twilio gets a 200 within ~9s
+    let responded = false;
+    const sendOnce = (xml) => {
+      if (responded) return false;
+      try {
+        res.setHeader("Content-Type","text/xml");
+        res.status(200).send(xml);
+        responded = true;
+        return true;
+      } catch { return false; }
+    };
+    const watchdog = setTimeout(() => {
+      const fallback = "Sorry—service is a bit slow right now. Please try again.";
+      if (sendOnce(`<Response><Message>${toXml(fallback)}</Message></Response>`)) {
+        dbg("twiml_sent_watchdog", { len: fallback.length, ms: WATCHDOG_MS });
+      }
+    }, WATCHDOG_MS);
 
     if (!Body) {
-      res.setHeader("Content-Type","text/xml");
-      res.status(200).send(`<Response><Message>Empty message. Please send text.</Message></Response>`);
+      sendOnce(`<Response><Message>Empty message. Please send text.</Message></Response>`);
+      clearTimeout(watchdog);
       return;
     }
 
-    // UK SMS photo guard
     if (!isWhatsApp && NumMedia > 0) {
-      res.setHeader("Content-Type","text/xml");
-      res.status(200).send(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
+      sendOnce(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
+      clearTimeout(watchdog);
       return;
     }
 
-    const reply = await gpt5Reply(Body);
-    const safe = reply.length > 1200 ? reply.slice(0,1190) + "…" : reply;
+    const reply = (await gpt5Reply(Body)).trim();
+    const safe = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
 
     if (isWhatsApp && TWILIO_WA_FROM) {
       try {
         await sendWhatsApp(cleanFrom, safe);
-        res.setHeader("Content-Type","text/xml");
-        res.status(200).send("<Response/>");
+        sendOnce("<Response/>");
+        clearTimeout(watchdog);
+        dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "wa_outbound" });
         return;
       } catch (e) {
-        await dbg("twilio_send_wa_error", { to: cleanFrom, message: String(e?.message || e) });
+        dbg("twilio_send_wa_error", { to: cleanFrom, message: String(e?.message || e) });
       }
     }
 
-    res.setHeader("Content-Type","text/xml");
-    res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
-    await dbg("twiml_sent", { to: cleanFrom, len: safe.length });
+    sendOnce(`<Response><Message>${toXml(safe)}</Message></Response>`);
+    clearTimeout(watchdog);
+    dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: isWhatsApp ? "wa_twiML" : "sms_twiML" });
   } catch (e) {
     const msg = String(e?.message || e);
-    await dbg("handler_error", { message: msg });
-    res.setHeader("Content-Type","text/xml");
-    res.status(200).send(`<Response><Message>Unhandled error: ${toXml(msg)}</Message></Response>`);
+    dbg("handler_error", { message: msg });
+    try {
+      res.setHeader("Content-Type","text/xml");
+      res.status(200).send(`<Response><Message>Unhandled error: ${toXml(msg)}</Message></Response>`);
+    } catch {}
   }
 }
