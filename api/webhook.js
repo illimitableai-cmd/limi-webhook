@@ -3,11 +3,12 @@ export const config = { api: { bodyParser: false } };
 
 /* ================ ENV ================ */
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 5500); // < Twilio 15s
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 6500); // < Twilio 15s
 const WATCHDOG_MS   = Number(process.env.WATCHDOG_MS   || 9000);
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 const MAX_SMS_CHARS  = Number(process.env.SMS_MAX_CHARS || 320);
-const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 120);
+const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);
+const CHAT_RETRY_TOKENS     = Number(process.env.CHAT_RETRY_TOKENS || 480);
 
 const SUPA_URL = process.env.SUPABASE_URL || "";
 const SUPA_KEY = process.env.SUPABASE_KEY || "";
@@ -94,41 +95,51 @@ const FINAL_INSTR =
 
 async function gpt5ChatFinal(userMsg) {
   const openai = await getOpenAI();
-  const messages = [
-    { role: "system", content: FINAL_INSTR },
-    { role: "user", content: userMsg }
-  ];
 
-  const req = {
-    model: CHAT_MODEL,
-    messages,
-    max_completion_tokens: Math.min(MAX_COMPLETION_TOKENS, 120)
-    // IMPORTANT: no 'stop', no 'temperature' — GPT-5 chat doesn't support them
-  };
+  async function chatOnce(maxTokens, label) {
+    const messages = [
+      { role: "system", content: FINAL_INSTR },
+      { role: "user", content: userMsg }
+    ];
+    const req = {
+      model: CHAT_MODEL,
+      messages,
+      max_completion_tokens: maxTokens
+      // IMPORTANT: no 'stop', no 'temperature'
+    };
+    dbg(label || "gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
+    const p = openai.chat.completions.create(req);
+    const r = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
+      p.then(x => { clearTimeout(t); resolve(x); })
+       .catch(e => { clearTimeout(t); resolve({ __error: e }); });
+    });
+    if (r?.__timeout) { dbg("gpt5_chat_error", { message: "timeout", maxTokens }); return { ans:"", finish:"timeout" }; }
+    if (r?.__error)   { dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error), maxTokens }); return { ans:"", finish:"error" }; }
+    const raw = r?.choices?.[0]?.message?.content?.trim() || "";
+    const ans = (extractFinalTag(raw) || raw).trim();
+    const finish = r?.choices?.[0]?.finish_reason || "";
+    dbg(label ? `${label}_reply` : "gpt5_chat_reply", { has_content: !!ans, finish_reason: finish, usage: r?.usage });
+    return { ans, finish };
+  }
 
-  dbg("gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
+  // First attempt (short cap)
+  let r1 = await chatOnce(Math.min(MAX_COMPLETION_TOKENS, 200), "gpt5_chat_request");
+  if (r1.ans) return r1.ans;
 
-  const p = openai.chat.completions.create(req);
-  const r = await new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-    p.then(x => { clearTimeout(t); resolve(x); })
-     .catch(e => { clearTimeout(t); resolve({ __error: e }); });
-  });
-
-  if (r?.__timeout) { dbg("gpt5_chat_error", { message: "timeout" }); return ""; }
-  if (r?.__error)   { dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error) }); return ""; }
-
-  const raw = r?.choices?.[0]?.message?.content?.trim() || "";
-  const ans = (extractFinalTag(raw) || raw).trim();
-  dbg("gpt5_chat_reply", { has_content: !!ans, finish_reason: r?.choices?.[0]?.finish_reason, usage: r?.usage });
-  return ans;
+  // Retry if we hit length or got nothing (reasoning ate budget)
+  if (!r1.ans || r1.finish === "length") {
+    const r2 = await chatOnce(Math.min(CHAT_RETRY_TOKENS, 600), "gpt5_chat_retry");
+    if (r2.ans) return r2.ans;
+  }
+  return "";
 }
 
 async function gpt5ResponsesFinal(userMsg) {
   const openai = await getOpenAI();
   const req = {
     model: CHAT_MODEL,
-    max_output_tokens: Math.min(MAX_COMPLETION_TOKENS, 120),
+    max_output_tokens: Math.min(Math.max(MAX_COMPLETION_TOKENS, 200), 600),
     instructions: FINAL_INSTR,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
@@ -202,7 +213,6 @@ export default async function handler(req, res) {
 
     dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
 
-    // Env sanity
     const missing = [];
     if (!process.env.OPENAI_KEY) missing.push("OPENAI_KEY");
     if (!process.env.TWILIO_SID || !process.env.TWILIO_AUTH) missing.push("TWILIO_SID/TWILIO_AUTH");
