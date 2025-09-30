@@ -8,7 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 /** --- ENV ---
  * Required: OPENAI_KEY, TWILIO_SID, TWILIO_AUTH, TWILIO_FROM
  * Optional: TWILIO_WHATSAPP_FROM (format: whatsapp:+447...)
- * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS
+ * Optional: OPENAI_CHAT_MODEL (default: gpt-5), LLM_TIMEOUT_MS, SMS_MAX_CHARS, CHAT_MAX_TOKENS
  * For debug logs: SUPABASE_URL, SUPABASE_KEY and a table `debug_logs`
  */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
@@ -19,15 +19,17 @@ const supabase =
     : null;
 
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 8000);
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 6500); // keep well under Twilio 15s
 const TWILIO_FROM = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
+const MAX_SMS_CHARS = Number(process.env.SMS_MAX_CHARS || 320);
+const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);
 
 /* ---------------- Debug logging ---------------- */
 async function dbg(step, payload) {
+  try { console.log("[dbg]", step, payload); } catch {}
   try {
-    if (!supabase) { console.log("[dbg]", step, payload); return; }
-    await supabase.from("debug_logs").insert([{ step, payload }]);
+    if (supabase) await supabase.from("debug_logs").insert([{ step, payload }]);
   } catch (e) {
     console.log("[dbg-fail]", step, String(e?.message || e));
   }
@@ -55,185 +57,43 @@ function smsNumber(s="") {
   return v;
 }
 
-/* ---------------- Robust extractor for Responses API ---------------- */
-// Deep-walk any modern Responses payload and collect visible text.
-function extractResponseText(resp) {
-  if (!resp) return "";
-  const chunks = [];
-
-  const visit = (node) => {
-    if (!node || typeof node !== "object") return;
-
-    if (typeof node.output_text === "string" && node.output_text) chunks.push(node.output_text);
-    if (typeof node.text === "string" && node.text) chunks.push(node.text);
-
-    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
-    if (Array.isArray(node.content)) { for (const it of node.content) visit(it); }
-    if (node.assistant_response && typeof node.assistant_response === "object") { visit(node.assistant_response); }
-
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (v && typeof v === "object") visit(v);
-    }
-  };
-
-  if (typeof resp.output_text === "string" && resp.output_text) chunks.push(resp.output_text);
-  if (Array.isArray(resp.output)) visit(resp.output);
-  if (!chunks.length && typeof resp === "object") visit(resp);
-
-  return chunks.join("").trim();
-}
-
-// Compact summary of content types present (to see where text may hide)
-function summariseContentTypes(resp) {
-  const counts = {};
-  const visit = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
-    if (node.type) counts[node.type] = (counts[node.type] || 0) + 1;
-    if (Array.isArray(node.content)) for (const it of node.content) visit(it);
-    if (node.assistant_response) visit(node.assistant_response);
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (v && typeof v === "object") visit(v);
-    }
-  };
-  if (resp && typeof resp === "object") visit(resp);
-  return counts;
-}
-
-/* ---------------- OpenAI (Responses API, GPT-5) ---------------- */
-export async function gpt5Reply(userMsg) {
-  const INSTRUCTIONS =
-    "Return ONLY the final answer. Be direct and clear in 1–4 sentences. " +
-    "Wrap the final answer like this: <final>...your answer...</final>.";
-
-  const extractFinal = (s="") => {
-    const m = s.match(/<final>([\s\S]*?)<\/final>/i);
-    return m ? m[1].trim() : "";
-  };
-
-  async function callWithTimeout(params, dbgLabel) {
-    await dbg(dbgLabel + "_request", {
-      model: params.model,
-      input_preview:
-        typeof params.input === "string"
-          ? params.input.slice(0,160)
-          : (JSON.stringify(params.input || "").slice(0,160))
-    });
-    const p = openai.responses.create(params);
-    return new Promise((resolve) => {
-      const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-      p.then((r) => { clearTimeout(t); resolve(r); })
-       .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
-    });
-  }
-
-  // Attempt 1 — Force JSON output via text.format=json_object, then parse { "final": "..." }
-  const paramsJson = {
+/* ---------------- OpenAI (Chat-first, fast) ---------------- */
+async function gpt5Reply(userMsg) {
+  const messages = [
+    { role: "system", content: "You are a concise SMS assistant for Limi. Reply in 1–2 short sentences. No preamble, no bullets, no markdown. Keep it friendly and direct." },
+    { role: "user", content: userMsg }
+  ];
+  const req = {
     model: CHAT_MODEL,
-    max_output_tokens: 300,
-    instructions:
-      "Respond ONLY as a single JSON object with this exact shape: {\"final\":\"...\"}. " +
-      "Do not include any other keys, markdown, or text outside JSON. " +
-      "Put the final human-facing answer in the \"final\" field.",
-    text: { format: { type: "json_object" } }, // request visible JSON text channel
-    input: [
-      {
-        role: "system",
-        content: [
-          { type: "input_text", text: "You must reply in JSON only. Output a single JSON object with shape {\"final\":\"...\"}." }
-        ]
-      },
-      { role: "user", content: [{ type: "input_text", text: userMsg }]}
-    ],
+    messages,
+    max_completion_tokens: MAX_COMPLETION_TOKENS
   };
-  let r = await callWithTimeout(paramsJson, "gpt5_jsonfmt");
+
+  await dbg("gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
+
+  const p = openai.chat.completions.create(req);
+  const r = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
+    p.then((x) => { clearTimeout(t); resolve(x); })
+     .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+  });
+
   if (r?.__timeout) {
-    await dbg("gpt5_timeout", { attempt: "jsonfmt", ms: LLM_TIMEOUT_MS });
-  } else if (!r?.__error) {
-    const all = extractResponseText(r);
-    let final = "";
-    try {
-      const start = all.indexOf("{"); const end = all.lastIndexOf("}");
-      const raw = (start >= 0 && end >= 0) ? all.slice(start, end + 1) : all;
-      const j = JSON.parse(raw);
-      if (j && typeof j.final === "string") final = j.final.trim();
-    } catch { /* ignore and continue */ }
-    await dbg("gpt5_jsonfmt_shape", {
-      output0_keys: Array.isArray(r.output) && r.output[0] ? Object.keys(r.output[0]) : [],
-      output0_shape: JSON.stringify(Array.isArray(r.output) ? r.output[0] : {}).slice(0,160)
-    });
-    if (final) return final;
-  } else {
-    await dbg("gpt5_error", { attempt: "jsonfmt", message: String(r.__error?.message || r.__error) });
+    await dbg("gpt5_chat_error", { message: "timeout", ms: LLM_TIMEOUT_MS });
+    return "Sorry—couldn’t answer just now.";
+  }
+  if (r?.__error) {
+    await dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error) });
+    return "Sorry—couldn’t answer just now.";
   }
 
-  // Attempt 2 — items with input_text (no text.format) + <final> contract
-  const paramsItems = {
-    model: CHAT_MODEL,
-    max_output_tokens: 300,
-    instructions: INSTRUCTIONS,
-    input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
-  };
-  r = await callWithTimeout(paramsItems, "gpt5_items");
-  if (r?.__timeout) {
-    await dbg("gpt5_timeout", { attempt: "items", ms: LLM_TIMEOUT_MS });
-  } else if (!r?.__error) {
-    const all = extractResponseText(r);
-    const final = extractFinal(all) || all;
-    await dbg("gpt5_items_shape", {
-      output0_keys: Array.isArray(r.output) && r.output[0] ? Object.keys(r.output[0]) : [],
-      output0_shape: JSON.stringify(Array.isArray(r.output) ? r.output[0] : {}).slice(0,160)
-    });
-    if (final) return final;
-  } else {
-    await dbg("gpt5_error", { attempt: "items", message: String(r.__error?.message || r.__error) });
-  }
-
-  // Attempt 3 — plain string input (minimal shape) + <final> contract
-  const paramsString = {
-    model: CHAT_MODEL,
-    max_output_tokens: 300,
-    instructions: INSTRUCTIONS,
-    input: `User: ${userMsg}\n\n<final>`,
-  };
-  r = await callWithTimeout(paramsString, "gpt5_string");
-  if (r?.__timeout) {
-    await dbg("gpt5_timeout_retry", { attempt: "string" });
-  } else if (!r?.__error) {
-    const all = extractResponseText(r);
-    const final = extractFinal(all) || all;
-    await dbg("gpt5_string_shape", {
-      output0_keys: Array.isArray(r.output) && r.output[0] ? Object.keys(r.output[0]) : [],
-      output0_shape: JSON.stringify(Array.isArray(r.output) ? r.output[0] : {}).slice(0,160)
-    });
-    if (final) return final;
-  } else {
-    await dbg("gpt5_error_retry", { attempt: "string", message: String(r.__error?.message || r.__error) });
-  }
-
-  // Attempt 4 — Chat Completions fallback (no custom temperature)
-  try {
-    const req4 = {
-      model: CHAT_MODEL,
-      messages: [
-        { role: "system", content: "You are a concise SMS assistant. Reply in 1–4 sentences." },
-        { role: "user", content: userMsg }
-      ]
-      // no temperature (model complained), no exotic params
-    };
-    await dbg("gpt5_chat_request", { model: req4.model, input_preview: JSON.stringify(req4.messages).slice(0,160) });
-    const ch = await openai.chat.completions.create(req4);
-    const content = ch?.choices?.[0]?.message?.content?.trim();
-    await dbg("gpt5_chat_reply", { has_content: !!content, finish_reason: ch?.choices?.[0]?.finish_reason, usage: ch?.usage });
-    if (content) return content;
-  } catch (e) {
-    await dbg("gpt5_chat_error", { message: String(e?.message || e) });
-  }
-
-  await dbg("gpt5_empty_after_retry", { model: CHAT_MODEL });
-  return "I’ll keep it brief: I couldn’t generate a response.";
+  const content = r?.choices?.[0]?.message?.content?.trim() || "";
+  await dbg("gpt5_chat_reply", {
+    has_content: !!content,
+    finish_reason: r?.choices?.[0]?.finish_reason,
+    usage: r?.usage
+  });
+  return content || "Sorry—couldn’t answer just now.";
 }
 
 /* ---------------- Twilio send (WA direct) ---------------- */
