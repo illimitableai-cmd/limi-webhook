@@ -1,17 +1,23 @@
 // api/webhook.js
 export const config = { api: { bodyParser: false } };
 
-/* ---------------- Config (env) ---------------- */
+/* =========================
+   Env & runtime config
+   ========================= */
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 5500);
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 5500); // keep < Twilio 15s
 const WATCHDOG_MS   = Number(process.env.WATCHDOG_MS   || 9000);
-const TWILIO_WA_FROM= (process.env.TWILIO_WHATSAPP_FROM || "").trim();
-const MAX_SMS_CHARS = Number(process.env.SMS_MAX_CHARS || 320);
+const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
+const MAX_SMS_CHARS  = Number(process.env.SMS_MAX_CHARS || 320);
 const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);
 
-/* ---------------- Lazy, dynamic clients (no module-load crashes) ---------------- */
-let _openai = null, _supabase = null, _twilio = null;
+const SUPA_URL = process.env.SUPABASE_URL || "";
+const SUPA_KEY = process.env.SUPABASE_KEY || "";
 
+/* =========================
+   Lazy clients (dynamic imports)
+   ========================= */
+let _openai = null;
 async function getOpenAI() {
   if (_openai) return _openai;
   const { default: OpenAI } = await import("openai");
@@ -21,15 +27,7 @@ async function getOpenAI() {
   return _openai;
 }
 
-async function getSupabase() {
-  if (_supabase !== null) return _supabase;
-  const url = process.env.SUPABASE_URL, key = process.env.SUPABASE_KEY;
-  if (!url || !key) { _supabase = false; return _supabase; }
-  const { createClient } = await import("@supabase/supabase-js");
-  _supabase = createClient(url, key);
-  return _supabase;
-}
-
+let _twilio = null;
 async function getTwilio() {
   if (_twilio) return _twilio;
   const sid = process.env.TWILIO_SID, auth = process.env.TWILIO_AUTH;
@@ -39,22 +37,30 @@ async function getTwilio() {
   return _twilio;
 }
 
-/* ---------------- Debug logging ---------------- */
-async function dbg(step, payload) {
+/* =========================
+   Non-blocking REST logger
+   ========================= */
+function dbg(step, payload) {
   try { console.log("[dbg]", step, payload); } catch {}
-  try {
-    const s = await getSupabase();
-    if (!s) return;
-    // fire-and-forget
-    s.from("debug_logs").insert([{ step, payload }]).catch(e =>
-      console.log("[dbg-fail]", step, String(e?.message || e))
-    );
-  } catch (e) {
-    console.log("[dbg-skip]", step, String(e?.message || e));
-  }
+  if (!SUPA_URL || !SUPA_KEY) return;
+  // Fire-and-forget; never await
+  fetch(`${SUPA_URL}/rest/v1/debug_logs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": SUPA_KEY,
+      "Authorization": `Bearer ${SUPA_KEY}`,
+      "Prefer": "return=minimal"
+    },
+    body: JSON.stringify([{ step, payload }])
+  }).catch(e => {
+    try { console.log("[dbg-rest-fail]", step, String(e?.message || e)); } catch {}
+  });
 }
 
-/* ---------------- Utils ---------------- */
+/* =========================
+   Small utils
+   ========================= */
 function toXml(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
@@ -91,7 +97,9 @@ function deepFindText(resp) {
   return out.join("").trim();
 }
 
-/* ---------------- GPT-5 only: hedged callers ---------------- */
+/* =========================
+   GPT-5 only (hedged): Chat + Responses
+   ========================= */
 const FINAL_INSTR =
   "Return ONLY the final answer, exactly one short friendly sentence. " +
   "Wrap it like this and nothing else: <final>your answer</final>.";
@@ -111,7 +119,7 @@ async function gpt5ChatFinal(userMsg) {
     max_completion_tokens: Math.min(MAX_COMPLETION_TOKENS, 80)
   };
 
-  await dbg("gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
+  dbg("gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
 
   const p = openai.chat.completions.create(req);
   const r = await new Promise((resolve) => {
@@ -120,16 +128,16 @@ async function gpt5ChatFinal(userMsg) {
      .catch(e => { clearTimeout(t); resolve({ __error: e }); });
   });
 
-  if (r?.__timeout) { await dbg("gpt5_chat_error", { message: "timeout" }); return ""; }
-  if (r?.__error)   { await dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error) }); return ""; }
+  if (r?.__timeout) { dbg("gpt5_chat_error", { message: "timeout" }); return ""; }
+  if (r?.__error)   { dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error) }); return ""; }
 
   const raw = r?.choices?.[0]?.message?.content?.trim() || "";
   const ans = extractFinalTag(raw) || raw;
-  await dbg("gpt5_chat_reply", { has_content: !!ans, finish_reason: r?.choices?.[0]?.finish_reason, usage: r?.usage });
+  dbg("gpt5_chat_reply", { has_content: !!ans, finish_reason: r?.choices?.[0]?.finish_reason, usage: r?.usage });
   return ans.trim();
 }
 
-// B) Responses API with the same <final>…</final> contract
+// B) Responses API with same <final> contract
 async function gpt5ResponsesFinal(userMsg) {
   const openai = await getOpenAI();
   const req = {
@@ -139,7 +147,7 @@ async function gpt5ResponsesFinal(userMsg) {
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
 
-  await dbg("gpt5_items_request", { model: req.model, input_preview: JSON.stringify(req.input).slice(0,160) });
+  dbg("gpt5_items_request", { model: req.model, input_preview: JSON.stringify(req.input).slice(0,160) });
 
   const p = openai.responses.create(req);
   const r = await new Promise((resolve) => {
@@ -148,12 +156,12 @@ async function gpt5ResponsesFinal(userMsg) {
      .catch(e => { clearTimeout(t); resolve({ __error: e }); });
   });
 
-  if (r?.__timeout) { await dbg("gpt5_items_error", { message: "timeout" }); return ""; }
-  if (r?.__error)   { await dbg("gpt5_items_error", { message: String(r.__error?.message || r.__error) }); return ""; }
+  if (r?.__timeout) { dbg("gpt5_items_error", { message: "timeout" }); return ""; }
+  if (r?.__error)   { dbg("gpt5_items_error", { message: String(r.__error?.message || r.__error) }); return ""; }
 
   const text = deepFindText(r);
   const ans  = extractFinalTag(text) || text || "";
-  await dbg("gpt5_items_shape", {
+  dbg("gpt5_items_shape", {
     output0_keys: Array.isArray(r.output) && r.output[0] ? Object.keys(r.output[0]) : [],
     final_len: ans.length
   });
@@ -166,19 +174,23 @@ async function gpt5Reply(userMsg) {
   return first || "Sorry—couldn’t answer just now.";
 }
 
-/* ---------------- Twilio WA (optional) ---------------- */
+/* =========================
+   Twilio WA (optional)
+   ========================= */
 async function sendWhatsApp(to, body) {
   const client = await getTwilio();
   const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
   const r = await client.messages.create({ from: TWILIO_WA_FROM, to: waTo, body });
-  await dbg("twilio_send_wa_ok", { sid: r.sid, to: waTo });
+  dbg("twilio_send_wa_ok", { sid: r.sid, to: waTo });
   return r;
 }
 
-/* ---------------- Handler (with watchdog) ---------------- */
+/* =========================
+   Handler (with watchdog)
+   ========================= */
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
-  await dbg("handler_enter", { ts: Date.now(), has_openai_key: !!process.env.OPENAI_KEY });
+  dbg("handler_enter", { ts: Date.now(), has_openai_key: !!process.env.OPENAI_KEY });
 
   try {
     if (req.method !== "POST") { res.status(405).send("Method Not Allowed"); return; }
@@ -206,9 +218,9 @@ export default async function handler(req, res) {
     const isWhatsApp = /^whatsapp:/i.test(From);
     const cleanFrom = smsNumber(From);
 
-    await dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
+    dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
 
-    // Env sanity: if missing, reply 200 TwiML (avoid 500)
+    // Env sanity: respond (200) rather than 500 on missing keys
     const missing = [];
     if (!process.env.OPENAI_KEY) missing.push("OPENAI_KEY");
     if (!process.env.TWILIO_SID || !process.env.TWILIO_AUTH) missing.push("TWILIO_SID/TWILIO_AUTH");
@@ -216,11 +228,11 @@ export default async function handler(req, res) {
       const msg = `Server config missing: ${missing.join(", ")}.`;
       res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>${toXml(msg)}</Message></Response>`);
-      await dbg("env_error_reply", { missing });
+      dbg("env_error_reply", { missing });
       return;
     }
 
-    // Watchdog: always answer within ~9s
+    // Watchdog (Twilio must get TwiML fast)
     let responded = false;
     const sendOnce = (xml) => {
       if (responded) return false;
@@ -240,6 +252,7 @@ export default async function handler(req, res) {
       return;
     }
 
+    // UK SMS photo guard
     if (!isWhatsApp && NumMedia > 0) {
       sendOnce(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
       clearTimeout(watchdog);
@@ -254,20 +267,20 @@ export default async function handler(req, res) {
         await sendWhatsApp(cleanFrom, safe);
         sendOnce("<Response/>");
         clearTimeout(watchdog);
-        await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "wa_outbound" });
+        dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "wa_outbound" });
         return;
       } catch (e) {
-        await dbg("twilio_send_wa_error", { to: cleanFrom, message: String(e?.message || e) });
+        dbg("twilio_send_wa_error", { to: cleanFrom, message: String(e?.message || e) });
       }
     }
 
     sendOnce(`<Response><Message>${toXml(safe)}</Message></Response>`);
     clearTimeout(watchdog);
-    await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: isWhatsApp ? "wa_twiML" : "sms_twiML" });
+    dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: isWhatsApp ? "wa_twiML" : "sms_twiML" });
 
   } catch (e) {
     const msg = String(e?.message || e);
-    await dbg("handler_error", { message: msg });
+    dbg("handler_error", { message: msg });
     try {
       res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Unhandled error: ${toXml(msg)}</Message></Response>`);
