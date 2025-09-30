@@ -3,17 +3,24 @@ export const config = { api: { bodyParser: false } };
 
 /* ================ ENV ================ */
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 6500); // < Twilio 15s
-const WATCHDOG_MS   = Number(process.env.WATCHDOG_MS   || 9000);
+
+// Keep this under Twilio's 15s webhook window.
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 11000);
+const WATCHDOG_MS   = Number(process.env.WATCHDOG_MS   || 14000);
+
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 const MAX_SMS_CHARS  = Number(process.env.SMS_MAX_CHARS || 320);
-const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);
-const CHAT_RETRY_TOKENS     = Number(process.env.CHAT_RETRY_TOKENS || 480);
 
+// Token caps
+const MAX_COMPLETION_TOKENS = Number(process.env.CHAT_MAX_TOKENS || 160);  // primary
+const CHAT_RETRY_TOKENS     = Number(process.env.CHAT_RETRY_TOKENS || 480); // retry
+const QUICK_TOKENS          = Number(process.env.QUICK_TOKENS || 48);       // rescue
+
+// Supabase REST logging (never blocks the response)
 const SUPA_URL = process.env.SUPABASE_URL || "";
 const SUPA_KEY = process.env.SUPABASE_KEY || "";
 
-/* ========== Lazy clients (dynamic) ========== */
+/* ========== Lazy clients ========== */
 let _openai = null;
 async function getOpenAI() {
   if (_openai) return _openai;
@@ -83,59 +90,75 @@ function deepFindText(resp) {
     if (Array.isArray(n)) { for (const it of n) visit(it); return; }
     if (Array.isArray(n.content)) for (const it of n.content) visit(it);
     if (n.assistant_response) visit(n.assistant_response);
-    for (const k of Object.keys(n)) { const v = n[k]; if (v && typeof v === "object") visit(v); }
+    for (const k of Object.keys(n)) {
+      const v = n[k]; if (v && typeof v === "object") visit(v);
+    }
   };
   if (Array.isArray(resp?.output)) visit(resp.output); else visit(resp);
   return out.join("").trim();
 }
-
-/* ========== GPT-5 only (Chat + Responses hedge) ========== */
 const FINAL_INSTR =
   "Return ONLY one short, friendly sentence. Wrap the answer exactly as <final>your answer</final>.";
 
-async function gpt5ChatFinal(userMsg) {
+/* ========== GPT-5 strategies ========== */
+async function chatOnce(userMsg, maxTokens, label) {
   const openai = await getOpenAI();
+  const messages = [
+    { role: "system", content: FINAL_INSTR },
+    { role: "user", content: userMsg }
+  ];
+  const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
+  dbg(label || "gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
 
-  async function chatOnce(maxTokens, label) {
-    const messages = [
-      { role: "system", content: FINAL_INSTR },
-      { role: "user", content: userMsg }
-    ];
-    const req = {
-      model: CHAT_MODEL,
-      messages,
-      max_completion_tokens: maxTokens
-      // IMPORTANT: no 'stop', no 'temperature'
-    };
-    dbg(label || "gpt5_chat_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
-    const p = openai.chat.completions.create(req);
-    const r = await new Promise((resolve) => {
-      const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-      p.then(x => { clearTimeout(t); resolve(x); })
-       .catch(e => { clearTimeout(t); resolve({ __error: e }); });
-    });
-    if (r?.__timeout) { dbg("gpt5_chat_error", { message: "timeout", maxTokens }); return { ans:"", finish:"timeout" }; }
-    if (r?.__error)   { dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error), maxTokens }); return { ans:"", finish:"error" }; }
-    const raw = r?.choices?.[0]?.message?.content?.trim() || "";
-    const ans = (extractFinalTag(raw) || raw).trim();
-    const finish = r?.choices?.[0]?.finish_reason || "";
-    dbg(label ? `${label}_reply` : "gpt5_chat_reply", { has_content: !!ans, finish_reason: finish, usage: r?.usage });
-    return { ans, finish };
-  }
+  const p = openai.chat.completions.create(req);
+  const r = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
+    p.then(x => { clearTimeout(t); resolve(x); })
+     .catch(e => { clearTimeout(t); resolve({ __error: e }); });
+  });
 
-  // First attempt (short cap)
-  let r1 = await chatOnce(Math.min(MAX_COMPLETION_TOKENS, 200), "gpt5_chat_request");
-  if (r1.ans) return r1.ans;
+  if (r?.__timeout) { dbg("gpt5_chat_error", { message: "timeout", maxTokens }); return ""; }
+  if (r?.__error)   { dbg("gpt5_chat_error", { message: String(r.__error?.message || r.__error), maxTokens }); return ""; }
 
-  // Retry if we hit length or got nothing (reasoning ate budget)
-  if (!r1.ans || r1.finish === "length") {
-    const r2 = await chatOnce(Math.min(CHAT_RETRY_TOKENS, 600), "gpt5_chat_retry");
-    if (r2.ans) return r2.ans;
-  }
-  return "";
+  const raw  = r?.choices?.[0]?.message?.content?.trim() || "";
+  const ans  = (extractFinalTag(raw) || raw).trim();
+  const finish = r?.choices?.[0]?.finish_reason || "";
+  dbg((label ? `${label}_reply` : "gpt5_chat_reply"), {
+    has_content: !!ans, finish_reason: finish, usage: r?.usage
+  });
+  return ans;
 }
 
-async function gpt5ResponsesFinal(userMsg) {
+// Very small cap, aggressive instruction to emit text *now*.
+async function quickAnswer(userMsg) {
+  const openai = await getOpenAI();
+  const messages = [
+    { role: "system", content:
+      "Answer immediately in 6–14 words. No analysis. If uncertain, say 'Not sure.' Wrap as <final>…</final>."
+    },
+    { role: "user", content: userMsg }
+  ];
+  const req = { model: CHAT_MODEL, messages, max_completion_tokens: QUICK_TOKENS };
+  dbg("gpt5_quick_request", { model: req.model, input_preview: JSON.stringify(messages).slice(0,160) });
+
+  const p = openai.chat.completions.create(req);
+  const r = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ __timeout: true }), Math.min(LLM_TIMEOUT_MS, 7000));
+    p.then(x => { clearTimeout(t); resolve(x); })
+     .catch(e => { clearTimeout(t); resolve({ __error: e }); });
+  });
+
+  if (r?.__timeout || r?.__error) {
+    dbg("gpt5_quick_error", { message: r?.__timeout ? "timeout" : String(r.__error?.message || r.__error) });
+    return "";
+  }
+  const raw = r?.choices?.[0]?.message?.content?.trim() || "";
+  const ans = (extractFinalTag(raw) || raw).trim();
+  dbg("gpt5_quick_reply", { has_content: !!ans, usage: r?.usage });
+  return ans;
+}
+
+async function responsesHedge(userMsg) {
   const openai = await getOpenAI();
   const req = {
     model: CHAT_MODEL,
@@ -143,7 +166,6 @@ async function gpt5ResponsesFinal(userMsg) {
     instructions: FINAL_INSTR,
     input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
   };
-
   dbg("gpt5_items_request", { model: req.model, input_preview: JSON.stringify(req.input).slice(0,160) });
 
   const p = openai.responses.create(req);
@@ -165,13 +187,38 @@ async function gpt5ResponsesFinal(userMsg) {
   return ans;
 }
 
-async function gpt5Reply(userMsg) {
-  const [a, b] = await Promise.allSettled([gpt5ChatFinal(userMsg), gpt5ResponsesFinal(userMsg)]);
-  const first = [a, b].map(s => s.status === "fulfilled" ? (s.value || "").trim() : "").find(Boolean);
-  return first || "Sorry—couldn’t answer just now.";
+// Resolve with first non-empty answer among candidates.
+// If all are empty, return "".
+async function firstAnswer(promises) {
+  const wrapped = promises.map(p => p.then(v => {
+    if (v && v.trim()) return v.trim();
+    throw new Error("empty");
+  }));
+  try {
+    // First fulfilled non-empty
+    return await Promise.any(wrapped);
+  } catch {
+    return "";
+  }
 }
 
-/* ========== Twilio WA (optional) ========== */
+async function gpt5Reply(userMsg) {
+  // Kick off three strategies in parallel for latency.
+  const primary = chatOnce(userMsg, Math.min(MAX_COMPLETION_TOKENS, 200), "gpt5_chat_request");
+  const quick   = quickAnswer(userMsg);
+  const hedge   = responsesHedge(userMsg);
+
+  let ans = await firstAnswer([primary, quick, hedge]);
+  if (ans) return ans;
+
+  // If still nothing, do a larger-cap retry for one last chance.
+  const retry = await chatOnce(userMsg, Math.min(CHAT_RETRY_TOKENS, 600), "gpt5_chat_retry");
+  if (retry) return retry;
+
+  return "Sorry—couldn’t answer just now.";
+}
+
+/* ========== Twilio (WhatsApp optional) ========== */
 async function sendWhatsApp(to, body) {
   const client = await getTwilio();
   const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
@@ -209,7 +256,7 @@ export default async function handler(req, res) {
     Body = (Body || "").trim();
     From = (From || "").trim();
     const isWhatsApp = /^whatsapp:/i.test(From);
-    const cleanFrom = smsNumber(From);
+    const cleanFrom  = smsNumber(From);
 
     dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
 
@@ -224,7 +271,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Watchdog: always respond
+    // Watchdog: guaranteed reply even if model stalls.
     let responded = false;
     const sendOnce = (xml) => {
       if (responded) return false;
@@ -244,6 +291,7 @@ export default async function handler(req, res) {
       return;
     }
 
+    // UK SMS photo guard
     if (!isWhatsApp && NumMedia > 0) {
       sendOnce(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
       clearTimeout(watchdog);
