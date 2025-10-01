@@ -24,7 +24,6 @@ const TWILIO_FROM    = (process.env.TWILIO_FROM || "").trim();
 const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 
 const MAX_SMS_CHARS      = Number(process.env.SMS_MAX_CHARS || 320);
-/* Lower quick cap so we get output before reasoning chews it all */
 const CHAT_MAX_TOKENS    = Number(process.env.CHAT_MAX_TOKENS || 60);
 const CHAT_RETRY_TOKENS  = Number(process.env.CHAT_RETRY_TOKENS || 480);
 
@@ -102,41 +101,35 @@ function withTimeout(promise, label, ctx={}) {
   });
 }
 
-/* 1) Streaming attempt: grab first text delta and stop */
+/* 1) Streaming attempt: grab first text delta; NO 'signal' param */
 async function attemptStream(userMsg) {
-  const controller = new AbortController();
   const startedAt = Date.now();
   try {
     const stream = await openai.responses.create({
       model: CHAT_MODEL,
       stream: true,
-      max_output_tokens: 80, // plenty for one sentence
+      max_output_tokens: 80, // one short sentence
       instructions: "Reply with EXACTLY one short, friendly sentence wrapped as <final>…</final>. Nothing else.",
       input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
-      signal: controller.signal,
     });
 
     await dbg("gpt5_stream_start", { model: CHAT_MODEL });
 
     let buf = "";
     let gotTextAt = 0;
-
-    const cutoffTimer = setTimeout(() => {
-      try { controller.abort(); } catch {}
-    }, STREAM_CUTOFF_MS);
+    let timedOut = false;
+    const cutoffTimer = setTimeout(() => { timedOut = true; }, STREAM_CUTOFF_MS);
 
     for await (const event of stream) {
-      // Per SDK, look for text deltas
+      if (timedOut) break;
       if (event.type === "response.output_text.delta") {
         if (!gotTextAt) {
           gotTextAt = Date.now();
           await dbg("gpt5_stream_first_delta", { ms: gotTextAt - startedAt });
         }
         buf += event.delta || "";
-        // exit early if we got the closing tag
         if (buf.includes("</final>")) break;
       }
-      // If the model returns a full message chunk instead (rare), capture it
       if (event.type === "response.output_text") {
         buf += (event.text || "");
         if (buf.includes("</final>")) break;
@@ -154,22 +147,18 @@ async function attemptStream(userMsg) {
 
     return final || null;
   } catch (e) {
-    if (e?.name === "AbortError") {
-      await dbg("gpt5_stream_abort", { after_ms: Date.now() - startedAt });
-      return null;
-    }
     await dbg("gpt5_stream_error", { message: String(e?.message || e) });
     return null;
   }
 }
 
-/* 2) Quick chat: tiny cap to avoid reasoning eat-all */
+/* 2) Quick chat: use max_completion_tokens (not max_tokens) */
 async function attemptQuickChat(userMsg, maxTokens=CHAT_MAX_TOKENS) {
   const messages = [
     { role: "system", content: "Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else." },
     { role: "user", content: userMsg },
   ];
-  const req = { model: CHAT_MODEL, messages, max_tokens: maxTokens }; // chat.completions uses max_tokens
+  const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
 
   const r = await withTimeout(
     openai.chat.completions.create(req),
@@ -215,13 +204,13 @@ async function attemptItems(userMsg) {
   return final || null;
 }
 
-/* 4) Chat retry with bigger cap */
+/* 4) Chat retry with bigger cap; use max_completion_tokens */
 async function attemptChatRetry(userMsg, maxTokens=CHAT_RETRY_TOKENS) {
   const messages = [
     { role: "system", content: "Return ONLY one short, friendly sentence. Wrap exactly as <final>your answer</final>." },
     { role: "user", content: userMsg },
   ];
-  const req = { model: CHAT_MODEL, messages, max_tokens: maxTokens };
+  const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
 
   const r = await withTimeout(openai.chat.completions.create(req), "gpt5_chat", {
     model: req.model, input_preview: safeSlice(messages), maxTokens
