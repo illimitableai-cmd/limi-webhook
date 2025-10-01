@@ -15,12 +15,15 @@ const supabase =
 
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 
-const ENABLE_STREAM     = (process.env.ENABLE_STREAM || "0") === "1"; // <- off by default
+// Streaming stays OFF unless you explicitly enable it
+const ENABLE_STREAM     = (process.env.ENABLE_STREAM || "0") === "1";
+
 const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS   || 11000);
-const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS      || 12500);
+const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS      || 12500); // < Twilio 15s
 const TWILIO_WA_FROM    = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
+
 const MAX_SMS_CHARS     = Number(process.env.SMS_MAX_CHARS    || 320);
-const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS  || 180); // give GPT-5 room to finish
+const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS  || 180);
 const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 480);
 
 /** --- Debug logging -------------------------------------------------- */
@@ -91,7 +94,7 @@ function withTimeout(promise, label, ctx={}) {
   });
 }
 
-/* (optional) Stream — disabled by default until org is verified */
+/* (optional) Stream — runs only when ENABLE_STREAM=1 */
 async function attemptStream(userMsg) {
   if (!ENABLE_STREAM) return null;
   try {
@@ -107,7 +110,7 @@ async function attemptStream(userMsg) {
     for await (const ev of stream) {
       if (ev.type === "response.output_text.delta") buf += ev.delta || "";
       if (ev.type === "response.output_text")       buf += ev.text || "";
-      if (buf.includes("</final>")) break;
+      if (buf.includes("</final>")) break; // early exit as soon as final is complete
     }
     const final = extractFinal(buf) || (buf ? buf.trim() : "");
     await dbg("gpt5_stream_done", { had_text: !!final, total_chars: buf.length });
@@ -161,7 +164,7 @@ async function attemptItems(userMsg) {
   return final || null;
 }
 
-/* NEW: Minimal string-prompt path via Responses */
+/* Minimal string-prompt path via Responses */
 async function attemptString(userMsg) {
   const req = {
     model: CHAT_MODEL,
@@ -204,7 +207,8 @@ async function attemptChatRetry(userMsg, maxTokens=CHAT_RETRY_TOKENS) {
 
 /** Gatherer ----------------------------------------------------------- */
 async function gpt5Reply(userMsg) {
-  const pStream = attemptStream(userMsg); // will return null if disabled
+  // Start multiple approaches and take the first that yields content
+  const pStream = attemptStream(userMsg); // null immediately if streaming disabled
   const pQuick  = new Promise(res => setTimeout(async () => res(await attemptQuickChat(userMsg)),  80));
   const pStr    = new Promise(res => setTimeout(async () => res(await attemptString(userMsg)),    140));
   const pItems  = new Promise(res => setTimeout(async () => res(await attemptItems(userMsg)),     220));
@@ -263,6 +267,7 @@ export default async function handler(req, res) {
       return;
     }
 
+    // UK SMS photo guard
     if (!isWhatsApp && NumMedia > 0) {
       res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
@@ -284,6 +289,7 @@ export default async function handler(req, res) {
       }
     }
 
+    // SMS reply (TwiML)
     res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
     await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "sms_twiML" });
