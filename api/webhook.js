@@ -13,8 +13,8 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-// Default to a widely available chat model; override with OPENAI_CHAT_MODEL if you like.
-const CHAT_MODEL         = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
+// 🔒 Hard-pin to GPT-5 (no fallback to GPT-4)
+const CHAT_MODEL         = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 const CHAT_MAX_TOKENS    = Number(process.env.CHAT_MAX_TOKENS || 180);
 const CHAT_RETRY_TOKENS  = Number(process.env.CHAT_RETRY_TOKENS || 480);
 const CHAT_TEMP          = Number(process.env.CHAT_TEMPERATURE || 0.4);
@@ -37,10 +37,7 @@ async function dbg(step, payload) {
 
 /** --- Utils ---------------------------------------------------------- */
 function toXml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -50,34 +47,33 @@ function readRawBody(req) {
     req.on("error", reject);
   });
 }
-function smsNumber(s = "") {
-  let v = String(s).replace(/^whatsapp:/i, "").trim();
+function smsNumber(s="") {
+  let v = String(s).replace(/^whatsapp:/i,"").trim();
   if (v.startsWith("00")) v = "+" + v.slice(2);
   if (v.startsWith("0")) v = "+44" + v.slice(1);
   return v;
 }
-const safeSlice = (obj, n = 220) => {
-  try { return JSON.stringify(obj).slice(0, n); } catch { return String(obj).slice(0, n); }
+const safeSlice = (obj, n=220) => {
+  try { return JSON.stringify(obj).slice(0,n); } catch { return String(obj).slice(0,n); }
 };
-const extractFinal = (s = "") => {
+const extractFinal = (s="") => {
   const m = String(s).match(/<final>([\s\S]*?)<\/final>/i);
   return m ? m[1].trim() : "";
 };
 
 /** --- Timed wrapper -------------------------------------------------- */
-function withTimeout(promise, label, ctx = {}) {
+function withTimeout(promise, label, ctx={}) {
   dbg(label + "_request", ctx);
   return new Promise((resolve) => {
     const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
-    promise
-      .then((r) => { clearTimeout(t); resolve(r); })
-      .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+    promise.then((r) => { clearTimeout(t); resolve(r); })
+           .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
   });
 }
 
-/** --- OpenAI helpers: minimal + compatible --------------------------- */
+/** --- OpenAI: GPT-5 via chat.completions only ------------------------ */
 async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS, temperature = CHAT_TEMP }) {
-  // Only fields accepted by chat.completions.create
+  // Only pass fields accepted by chat.completions
   const req = { model, messages, max_tokens: maxTokens, temperature };
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
@@ -91,40 +87,36 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CH
   return (txt || "").trim();
 }
 
-function wrapFinalInstruction() {
+function systemInstruction() {
   return `Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else.
 
-If the user asks a question, answer it in one short sentence. If you need to say you don't know, still wrap it the same way.`;
+If the user asks a question, answer it in one short sentence. If you don't know, say so—still wrapped in <final> tags.`;
 }
 
-/** --- Single-path reply builder (no Responses API, no streaming) ----- */
-async function gptReply(userMsg) {
-  // Attempt 1: strict formatting
-  const messages = [
-    { role: "system", content: wrapFinalInstruction() },
+/** --- Single-path reply (two attempts), no model fallback ------------ */
+async function llmReply(userMsg) {
+  // Attempt 1: strict format
+  const messagesA = [
+    { role: "system", content: systemInstruction() },
     { role: "user",   content: userMsg }
   ];
-
-  let txt = await safeChatCompletion({ messages, maxTokens: CHAT_MAX_TOKENS });
+  let txt = await safeChatCompletion({ messages: messagesA, maxTokens: CHAT_MAX_TOKENS });
   let final = extractFinal(txt || "");
-
-  // If the model ignored the tags, salvage anyway
   if (!final && txt) final = txt.trim();
 
-  // Attempt 2: softer instruction + larger token cap
+  // Attempt 2: softer wording + bigger cap
   if (!final) {
-    const retryMessages = [
+    const messagesB = [
       { role: "system", content: "Return a short, friendly answer. Wrap it as <final>...</final>." },
-      { role: "user", content: userMsg }
+      { role: "user",   content: userMsg }
     ];
-    txt = await safeChatCompletion({ messages: retryMessages, maxTokens: CHAT_RETRY_TOKENS });
+    txt = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
     final = extractFinal(txt || "") || (txt ? txt.trim() : "");
   }
-
   return final || null;
 }
 
-/** --- Twilio WA helper ----------------------------------------------- */
+/** --- Twilio WhatsApp helper ---------------------------------------- */
 async function sendWhatsApp(to, body) {
   if (!TWILIO_WA_FROM) throw new Error("Missing TWILIO_WHATSAPP_FROM");
   const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
@@ -141,7 +133,7 @@ export default async function handler(req, res) {
     if (req.method !== "POST") { res.status(405).send("Method Not Allowed"); return; }
 
     const raw = await readRawBody(req);
-    let Body = null, From = null, NumMedia = 0;
+    let Body=null, From=null, NumMedia=0;
 
     if (raw.trim().startsWith("{")) {
       const j = JSON.parse(raw);
@@ -165,32 +157,32 @@ export default async function handler(req, res) {
     await dbg("webhook_in", { from: cleanFrom, channel: isWhatsApp ? "whatsapp" : "sms", body_len: Body.length, numMedia: NumMedia });
 
     if (!Body) {
-      res.setHeader("Content-Type", "text/xml");
+      res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Empty message. Please send text.</Message></Response>`);
       return;
     }
 
     // UK SMS photo guard
     if (!isWhatsApp && NumMedia > 0) {
-      res.setHeader("Content-Type", "text/xml");
+      res.setHeader("Content-Type","text/xml");
       res.status(200).send(`<Response><Message>Pics don’t work over UK SMS. WhatsApp this same number instead 👍</Message></Response>`);
       return;
     }
 
-    // Build the reply with a watchdog to avoid long hangs
-    const replyPromise = gptReply(Body);
+    // Build the reply with a watchdog (no model fallback)
+    const replyPromise = llmReply(Body);
     const watchdog = new Promise((resolve) =>
       setTimeout(() => { dbg("watchdog_fired", { ms: WATCHDOG_MS }); resolve(null); }, WATCHDOG_MS)
     );
     const final = await Promise.race([replyPromise, watchdog]);
 
     const reply = final || "Sorry—service is a bit slow right now. Please try again.";
-    const safe = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
+    const safe  = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
 
     if (isWhatsApp && TWILIO_WA_FROM) {
       try {
         await sendWhatsApp(cleanFrom, safe);
-        res.setHeader("Content-Type", "text/xml");
+        res.setHeader("Content-Type","text/xml");
         res.status(200).send("<Response/>");
         return;
       } catch (e) {
@@ -199,14 +191,14 @@ export default async function handler(req, res) {
     }
 
     // SMS reply (TwiML)
-    res.setHeader("Content-Type", "text/xml");
+    res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
     await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "sms_twiML" });
 
   } catch (e) {
     const msg = String(e?.message || e);
     await dbg("handler_error", { message: msg });
-    res.setHeader("Content-Type", "text/xml");
+    res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>Unhandled error: ${toXml(msg)}</Message></Response>`);
   }
 }
