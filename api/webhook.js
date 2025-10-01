@@ -15,7 +15,7 @@ const supabase =
 
 // 🔒 GPT-5 only (no fallback)
 const CHAT_MODEL        = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS || 120);  // modest, we return a short answer
+const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS || 120);   // modest caps: concise replies
 const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 180);
 
 const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS || 11000);
@@ -25,8 +25,8 @@ const MAX_SMS_CHARS     = Number(process.env.SMS_MAX_CHARS || 320);
 const TWILIO_WA_FROM    = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 
 // 🔧 Output shaping (tweak without code changes)
-const FINAL_MAX_CHARS       = Number(process.env.FINAL_MAX_CHARS || 240); // keep room for SMS
-const FINAL_MAX_SENTENCES   = Number(process.env.FINAL_MAX_SENTENCES || 2);
+const FINAL_MAX_CHARS     = Number(process.env.FINAL_MAX_CHARS || 240);
+const FINAL_MAX_SENTENCES = Number(process.env.FINAL_MAX_SENTENCES || 2);
 
 /** --- Debug logging -------------------------------------------------- */
 async function dbg(step, payload) {
@@ -96,12 +96,18 @@ function withTimeout(promise, label, ctx = {}) {
   });
 }
 
-/** --- OpenAI: GPT-5 chat.completions (no temperature) ---------------- */
+/** --- OpenAI: GPT-5 chat.completions (no temperature, no stop) ------- */
 async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS }) {
   const isGpt5 = /^gpt-5/i.test(model);
-  const req = { model, messages, stop: ["</final>"] }; // encourage early stop at closing tag
-  if (isGpt5) req.max_completion_tokens = maxTokens;
-  else { req.max_tokens = maxTokens; req.temperature = 1; }
+
+  const req = { model, messages };
+  if (isGpt5) {
+    req.max_completion_tokens = maxTokens;     // GPT-5 field
+    // Do NOT send temperature or stop for GPT-5
+  } else {
+    req.max_tokens = maxTokens;                // compatibility if you ever switch
+    req.temperature = 1;
+  }
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
   const r = await withTimeout(openai.chat.completions.create(req), "openai_chat", { model, maxTokens });
@@ -215,7 +221,9 @@ export default async function handler(req, res) {
 
     if (isWhatsApp && TWILIO_WA_FROM) {
       try {
-        await sendWhatsApp(cleanFrom, safe.replace(/^<final>|<\/final>$/g, "")); // WA doesn't need tags
+        // WhatsApp body without the <final> tags
+        const waBody = safe.replace(/^<final>|<\/final>$/g, "");
+        await sendWhatsApp(cleanFrom, waBody);
         res.setHeader("Content-Type","text/xml");
         res.status(200).send("<Response/>");
         return;
@@ -224,7 +232,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // SMS reply (TwiML) – keep tags; your client extracts or just shows nicely
+    // SMS reply (TwiML) – keep tags; your client can parse or show them
     res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
     await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "sms_twiML" });
