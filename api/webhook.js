@@ -72,9 +72,17 @@ function withTimeout(promise, label, ctx={}) {
 }
 
 /** --- OpenAI: GPT-5 via chat.completions only ------------------------ */
+// IMPORTANT: GPT-5 expects `max_completion_tokens` (NOT `max_tokens`)
 async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS, temperature = CHAT_TEMP }) {
-  // Only pass fields accepted by chat.completions
-  const req = { model, messages, max_tokens: maxTokens, temperature };
+  const isGpt5 = /^gpt-5/i.test(model);
+
+  const req = {
+    model,
+    messages,
+    temperature
+  };
+  if (isGpt5) req.max_completion_tokens = maxTokens;
+  else req.max_tokens = maxTokens; // keep compatibility if you ever point at a non-gpt-5 model
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
   const r = await withTimeout(openai.chat.completions.create(req), "openai_chat", { model, maxTokens });
