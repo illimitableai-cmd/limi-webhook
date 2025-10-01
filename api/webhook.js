@@ -71,18 +71,23 @@ function withTimeout(promise, label, ctx={}) {
   });
 }
 
-/** --- OpenAI: GPT-5 via chat.completions only ------------------------ */
-// IMPORTANT: GPT-5 expects `max_completion_tokens` (NOT `max_tokens`)
-async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS, temperature = CHAT_TEMP }) {
+// IMPORTANT: GPT-5 expects `max_completion_tokens` and does NOT accept `temperature`
+async function safeChatCompletion({
+  messages,
+  model = CHAT_MODEL,
+  maxTokens = CHAT_MAX_TOKENS,
+  temperature = Number(process.env.CHAT_TEMPERATURE || 1) // ignored for gpt-5
+}) {
   const isGpt5 = /^gpt-5/i.test(model);
 
-  const req = {
-    model,
-    messages,
-    temperature
-  };
-  if (isGpt5) req.max_completion_tokens = maxTokens;
-  else req.max_tokens = maxTokens; // keep compatibility if you ever point at a non-gpt-5 model
+  const req = { model, messages };
+  if (isGpt5) {
+    req.max_completion_tokens = maxTokens;
+    // DO NOT set temperature for gpt-5
+  } else {
+    req.max_tokens = maxTokens;
+    req.temperature = temperature;
+  }
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
   const r = await withTimeout(openai.chat.completions.create(req), "openai_chat", { model, maxTokens });
@@ -95,34 +100,6 @@ async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CH
   return (txt || "").trim();
 }
 
-function systemInstruction() {
-  return `Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else.
-
-If the user asks a question, answer it in one short sentence. If you don't know, say so—still wrapped in <final> tags.`;
-}
-
-/** --- Single-path reply (two attempts), no model fallback ------------ */
-async function llmReply(userMsg) {
-  // Attempt 1: strict format
-  const messagesA = [
-    { role: "system", content: systemInstruction() },
-    { role: "user",   content: userMsg }
-  ];
-  let txt = await safeChatCompletion({ messages: messagesA, maxTokens: CHAT_MAX_TOKENS });
-  let final = extractFinal(txt || "");
-  if (!final && txt) final = txt.trim();
-
-  // Attempt 2: softer wording + bigger cap
-  if (!final) {
-    const messagesB = [
-      { role: "system", content: "Return a short, friendly answer. Wrap it as <final>...</final>." },
-      { role: "user",   content: userMsg }
-    ];
-    txt = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
-    final = extractFinal(txt || "") || (txt ? txt.trim() : "");
-  }
-  return final || null;
-}
 
 /** --- Twilio WhatsApp helper ---------------------------------------- */
 async function sendWhatsApp(to, body) {
