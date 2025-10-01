@@ -15,17 +15,13 @@ const supabase =
 
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 
-/* Keep under Twilio’s 15s end-to-end */
-const LLM_TIMEOUT_MS   = Number(process.env.LLM_TIMEOUT_MS   || 11000);
-const WATCHDOG_MS      = Number(process.env.WATCHDOG_MS      || 12500);
-const STREAM_CUTOFF_MS = Number(process.env.STREAM_CUTOFF_MS || 7500); // abandon stream if no text by then
-
-const TWILIO_FROM    = (process.env.TWILIO_FROM || "").trim();
-const TWILIO_WA_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
-
-const MAX_SMS_CHARS      = Number(process.env.SMS_MAX_CHARS || 320);
-const CHAT_MAX_TOKENS    = Number(process.env.CHAT_MAX_TOKENS || 60);
-const CHAT_RETRY_TOKENS  = Number(process.env.CHAT_RETRY_TOKENS || 480);
+const ENABLE_STREAM     = (process.env.ENABLE_STREAM || "0") === "1"; // <- off by default
+const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS   || 11000);
+const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS      || 12500);
+const TWILIO_WA_FROM    = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
+const MAX_SMS_CHARS     = Number(process.env.SMS_MAX_CHARS    || 320);
+const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS  || 180); // give GPT-5 room to finish
+const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 480);
 
 /** --- Debug logging -------------------------------------------------- */
 async function dbg(step, payload) {
@@ -55,7 +51,7 @@ function smsNumber(s="") {
   if (v.startsWith("0")) v = "+44" + v.slice(1);
   return v;
 }
-const safeSlice = (obj, n=200) => {
+const safeSlice = (obj, n=220) => {
   try { return JSON.stringify(obj).slice(0,n); } catch { return String(obj).slice(0,n); }
 };
 const extractFinal = (s="") => {
@@ -79,15 +75,9 @@ function deepFindText(resp) {
 }
 function firstTruthy(promises) {
   return new Promise((resolve) => {
-    let pending = promises.length;
-    let done = false;
-    const onSettle = (v) => {
-      if (!done && v) { done = true; resolve(v); return; }
-      if (--pending === 0 && !done) resolve(null);
-    };
-    for (const p of promises) {
-      Promise.resolve(p).then(onSettle).catch(() => onSettle(null));
-    }
+    let pending = promises.length, done = false;
+    const doneOne = (v) => { if (!done && v) { done = true; resolve(v); } else if (--pending === 0 && !done) resolve(null); };
+    for (const p of promises) Promise.resolve(p).then(doneOne).catch(() => doneOne(null));
   });
 }
 
@@ -101,50 +91,26 @@ function withTimeout(promise, label, ctx={}) {
   });
 }
 
-/* 1) Streaming attempt: grab first text delta; NO 'signal' param */
+/* (optional) Stream — disabled by default until org is verified */
 async function attemptStream(userMsg) {
-  const startedAt = Date.now();
+  if (!ENABLE_STREAM) return null;
   try {
     const stream = await openai.responses.create({
       model: CHAT_MODEL,
       stream: true,
-      max_output_tokens: 80, // one short sentence
+      max_output_tokens: 80,
       instructions: "Reply with EXACTLY one short, friendly sentence wrapped as <final>…</final>. Nothing else.",
       input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
     });
 
-    await dbg("gpt5_stream_start", { model: CHAT_MODEL });
-
     let buf = "";
-    let gotTextAt = 0;
-    let timedOut = false;
-    const cutoffTimer = setTimeout(() => { timedOut = true; }, STREAM_CUTOFF_MS);
-
-    for await (const event of stream) {
-      if (timedOut) break;
-      if (event.type === "response.output_text.delta") {
-        if (!gotTextAt) {
-          gotTextAt = Date.now();
-          await dbg("gpt5_stream_first_delta", { ms: gotTextAt - startedAt });
-        }
-        buf += event.delta || "";
-        if (buf.includes("</final>")) break;
-      }
-      if (event.type === "response.output_text") {
-        buf += (event.text || "");
-        if (buf.includes("</final>")) break;
-      }
+    for await (const ev of stream) {
+      if (ev.type === "response.output_text.delta") buf += ev.delta || "";
+      if (ev.type === "response.output_text")       buf += ev.text || "";
+      if (buf.includes("</final>")) break;
     }
-
-    clearTimeout(cutoffTimer);
-
     const final = extractFinal(buf) || (buf ? buf.trim() : "");
-    await dbg("gpt5_stream_done", {
-      ms: Date.now() - startedAt,
-      had_text: !!final,
-      total_chars: buf.length
-    });
-
+    await dbg("gpt5_stream_done", { had_text: !!final, total_chars: buf.length });
     return final || null;
   } catch (e) {
     await dbg("gpt5_stream_error", { message: String(e?.message || e) });
@@ -152,7 +118,7 @@ async function attemptStream(userMsg) {
   }
 }
 
-/* 2) Quick chat: use max_completion_tokens (not max_tokens) */
+/* Quick chat (short answer) */
 async function attemptQuickChat(userMsg, maxTokens=CHAT_MAX_TOKENS) {
   const messages = [
     { role: "system", content: "Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else." },
@@ -160,32 +126,27 @@ async function attemptQuickChat(userMsg, maxTokens=CHAT_MAX_TOKENS) {
   ];
   const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
 
-  const r = await withTimeout(
-    openai.chat.completions.create(req),
-    "gpt5_quick",
-    { model: req.model, maxTokens, input_preview: safeSlice(messages) }
-  );
+  const r = await withTimeout(openai.chat.completions.create(req), "gpt5_quick", {
+    model: req.model, maxTokens, input_preview: safeSlice(messages)
+  });
 
   if (r?.__timeout) { await dbg("gpt5_quick_error", { message:"timeout" }); return null; }
   if (r?.__error)   { await dbg("gpt5_quick_error", { message:String(r.__error?.message || r.__error) }); return null; }
 
   const txt = r?.choices?.[0]?.message?.content?.trim() || "";
   await dbg("gpt5_quick_reply", { has_content: !!txt, usage: r?.usage });
-
   const final = extractFinal(txt);
   return final || (txt ? txt.trim() : null);
 }
 
-/* 3) Responses (non-stream) */
+/* Responses (non-stream) */
 async function attemptItems(userMsg) {
-  await dbg("gpt5_items_request", { model: CHAT_MODEL, input_preview: safeSlice(userMsg, 140) });
   const req = {
     model: CHAT_MODEL,
-    max_output_tokens: 200,
+    max_output_tokens: 120,
     instructions: "Return only one sentence wrapped like <final>…</final>. No other text.",
     input: [{ role:"user", content:[{ type:"input_text", text: userMsg }]}],
   };
-
   const r = await withTimeout(openai.responses.create(req), "gpt5_items", {
     model: req.model, input_preview: safeSlice(req.input)
   });
@@ -196,15 +157,31 @@ async function attemptItems(userMsg) {
   const text  = deepFindText(r);
   const final = extractFinal(text) || (text ? text.trim() : "");
   const output0 = Array.isArray(r.output) ? r.output[0] : null;
-
-  await dbg("gpt5_items_shape", {
-    final_len: (final||"").length,
-    output0_keys: output0 ? Object.keys(output0) : []
-  });
+  await dbg("gpt5_items_shape", { final_len: (final||"").length, output0_keys: output0 ? Object.keys(output0) : [] });
   return final || null;
 }
 
-/* 4) Chat retry with bigger cap; use max_completion_tokens */
+/* NEW: Minimal string-prompt path via Responses */
+async function attemptString(userMsg) {
+  const req = {
+    model: CHAT_MODEL,
+    max_output_tokens: 80,
+    input: `User: ${userMsg}\n\n<final>`
+  };
+  const r = await withTimeout(openai.responses.create(req), "gpt5_string", {
+    model: req.model, input_preview: safeSlice(req.input)
+  });
+
+  if (r?.__timeout) { await dbg("gpt5_string_error", { message:"timeout" }); return null; }
+  if (r?.__error)   { await dbg("gpt5_string_error", { message:String(r.__error?.message || r.__error) }); return null; }
+
+  const text  = deepFindText(r);
+  const final = extractFinal(text) || (text ? text.trim() : "");
+  await dbg("gpt5_string_shape", { final_len: (final||"").length });
+  return final || null;
+}
+
+/* Chat retry with bigger cap */
 async function attemptChatRetry(userMsg, maxTokens=CHAT_RETRY_TOKENS) {
   const messages = [
     { role: "system", content: "Return ONLY one short, friendly sentence. Wrap exactly as <final>your answer</final>." },
@@ -221,20 +198,19 @@ async function attemptChatRetry(userMsg, maxTokens=CHAT_RETRY_TOKENS) {
 
   const text = r?.choices?.[0]?.message?.content?.trim() || "";
   await dbg("gpt5_chat_reply", { has_content: !!text, usage: r?.usage, finish_reason: r?.choices?.[0]?.finish_reason });
-
   const final = extractFinal(text);
   return final || (text ? text.trim() : null);
 }
 
-/** Gatherer: stream first, then quick/items/retry in a race */
+/** Gatherer ----------------------------------------------------------- */
 async function gpt5Reply(userMsg) {
-  const pStream = attemptStream(userMsg);                 // start now
-  const pQuick  = new Promise(res => setTimeout(async () => res(await attemptQuickChat(userMsg)), 100));
-  const pItems  = new Promise(res => setTimeout(async () => res(await attemptItems(userMsg)),     200));
+  const pStream = attemptStream(userMsg); // will return null if disabled
+  const pQuick  = new Promise(res => setTimeout(async () => res(await attemptQuickChat(userMsg)),  80));
+  const pStr    = new Promise(res => setTimeout(async () => res(await attemptString(userMsg)),    140));
+  const pItems  = new Promise(res => setTimeout(async () => res(await attemptItems(userMsg)),     220));
   const pRetry  = new Promise(res => setTimeout(async () => res(await attemptChatRetry(userMsg)), 700));
 
-  const winner = firstTruthy([pStream, pQuick, pItems, pRetry]);
-
+  const winner = firstTruthy([pStream, pQuick, pStr, pItems, pRetry]);
   const watchdog = new Promise((resolve) =>
     setTimeout(() => { dbg("watchdog_fired", { ms: WATCHDOG_MS }); resolve("__WATCHDOG__"); }, WATCHDOG_MS)
   );
@@ -244,7 +220,7 @@ async function gpt5Reply(userMsg) {
   return first || null;
 }
 
-/** --- Twilio send (WA direct) --------------------------------------- */
+/** --- Twilio WA helper ----------------------------------------------- */
 async function sendWhatsApp(to, body) {
   if (!TWILIO_WA_FROM) throw new Error("Missing TWILIO_WHATSAPP_FROM");
   const waTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
@@ -293,12 +269,9 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Ask the model(s)
     const final = await gpt5Reply(Body);
-
-    // If watchdog fired or nothing worked, send graceful fallback
     const reply = final || "Sorry—service is a bit slow right now. Please try again.";
-    const safe = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
+    const safe  = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
 
     if (isWhatsApp && TWILIO_WA_FROM) {
       try {
@@ -311,7 +284,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // SMS TwiML
     res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
     await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "sms_twiML" });
