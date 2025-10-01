@@ -13,11 +13,10 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-// 🔒 Hard-pin to GPT-5 (no fallback to GPT-4)
+// 🔒 Hard-pin to GPT-5 (no fallback)
 const CHAT_MODEL         = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 const CHAT_MAX_TOKENS    = Number(process.env.CHAT_MAX_TOKENS || 180);
 const CHAT_RETRY_TOKENS  = Number(process.env.CHAT_RETRY_TOKENS || 480);
-const CHAT_TEMP          = Number(process.env.CHAT_TEMPERATURE || 0.4);
 
 const LLM_TIMEOUT_MS     = Number(process.env.LLM_TIMEOUT_MS || 11000);
 const WATCHDOG_MS        = Number(process.env.WATCHDOG_MS || 12500);
@@ -37,7 +36,7 @@ async function dbg(step, payload) {
 
 /** --- Utils ---------------------------------------------------------- */
 function toXml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return String(s).replace(/&/g,"&amp;").replace(/<//g,"&lt;").replace(/>/g,"&gt;");
 }
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -71,22 +70,21 @@ function withTimeout(promise, label, ctx={}) {
   });
 }
 
-// IMPORTANT: GPT-5 expects `max_completion_tokens` and does NOT accept `temperature`
+/** --- OpenAI: GPT-5 chat.completions (no temperature) ---------------- */
 async function safeChatCompletion({
   messages,
   model = CHAT_MODEL,
-  maxTokens = CHAT_MAX_TOKENS,
-  temperature = Number(process.env.CHAT_TEMPERATURE || 1) // ignored for gpt-5
+  maxTokens = CHAT_MAX_TOKENS
 }) {
   const isGpt5 = /^gpt-5/i.test(model);
 
   const req = { model, messages };
   if (isGpt5) {
-    req.max_completion_tokens = maxTokens;
-    // DO NOT set temperature for gpt-5
+    req.max_completion_tokens = maxTokens; // GPT-5 field
+    // DO NOT set temperature for GPT-5
   } else {
-    req.max_tokens = maxTokens;
-    req.temperature = temperature;
+    req.max_tokens = maxTokens;            // non-GPT-5 compatibility
+    req.temperature = 1;
   }
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
@@ -100,6 +98,34 @@ async function safeChatCompletion({
   return (txt || "").trim();
 }
 
+/** --- LLM reply helpers --------------------------------------------- */
+function systemInstruction() {
+  return `Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else.
+
+If the user asks a question, answer it in one short sentence. If you don't know, say so—still wrapped in <final> tags.`;
+}
+
+async function llmReply(userMsg) {
+  // Attempt 1: strict format
+  const messagesA = [
+    { role: "system", content: systemInstruction() },
+    { role: "user",   content: userMsg }
+  ];
+  let txt = await safeChatCompletion({ messages: messagesA, maxTokens: CHAT_MAX_TOKENS });
+  let final = extractFinal(txt || "");
+  if (!final && txt) final = txt.trim();
+
+  // Attempt 2: softer prompt + bigger cap
+  if (!final) {
+    const messagesB = [
+      { role: "system", content: "Return a short, friendly answer. Wrap it as <final>...</final>." },
+      { role: "user",   content: userMsg }
+    ];
+    txt = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
+    final = extractFinal(txt || "") || (txt ? txt.trim() : "");
+  }
+  return final || null;
+}
 
 /** --- Twilio WhatsApp helper ---------------------------------------- */
 async function sendWhatsApp(to, body) {
