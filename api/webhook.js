@@ -14,17 +14,17 @@ const supabase =
     : null;
 
 const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-
-// Streaming stays OFF unless you explicitly enable it
-const ENABLE_STREAM     = (process.env.ENABLE_STREAM || "0") === "1";
-
+const ENABLE_STREAM     = (process.env.ENABLE_STREAM || "0") === "1"; // opt-in
 const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS   || 11000);
-const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS      || 12500); // < Twilio 15s
+const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS      || 12500);
 const TWILIO_WA_FROM    = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 
 const MAX_SMS_CHARS     = Number(process.env.SMS_MAX_CHARS    || 320);
 const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS  || 180);
 const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 480);
+
+// (optional) override effort; default low
+const REASONING_EFFORT  = (process.env.REASONING_EFFORT || "low"); // 'low' | 'medium' | 'high'
 
 /** --- Debug logging -------------------------------------------------- */
 async function dbg(step, payload) {
@@ -94,15 +94,51 @@ function withTimeout(promise, label, ctx={}) {
   });
 }
 
-/* (optional) Stream — runs only when ENABLE_STREAM=1 */
+/* 0) JSON-first attempt: force {"final":"..."} */
+async function attemptJson(userMsg) {
+  const req = {
+    model: CHAT_MODEL,
+    modalities: ["text"],
+    reasoning: { effort: REASONING_EFFORT },
+    max_output_tokens: 80,
+    text: { format: { type: "json_object" } },
+    instructions: "Output JSON only with shape {\"final\":\"...\"}. No other keys.",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: "Return a single JSON object only." }]},
+      { role: "user",   content: [{ type: "input_text", text: userMsg }]}
+    ]
+  };
+  const r = await withTimeout(openai.responses.create(req), "gpt5_jsonfmt", {
+    model: req.model, input_preview: safeSlice(req.input)
+  });
+  if (r?.__timeout) { await dbg("gpt5_jsonfmt_error", { message:"timeout" }); return null; }
+  if (r?.__error)   { await dbg("gpt5_jsonfmt_error", { message:String(r.__error?.message || r.__error) }); return null; }
+
+  // try to pull {"final": "..."} from any json field
+  let final = null;
+  const tryJson = (node) => {
+    if (!node || typeof node !== "object" || final) return;
+    if (node.json && typeof node.json === "object" && typeof node.json.final === "string") final = node.json.final.trim();
+    for (const k of Object.keys(node)) tryJson(node[k]);
+  };
+  tryJson(r);
+  if (final) return final;
+
+  const text = deepFindText(r);
+  return extractFinal(text) || (text ? text.trim() : null);
+}
+
+/* 1) (optional) Stream — enabled only when ENV allows */
 async function attemptStream(userMsg) {
   if (!ENABLE_STREAM) return null;
   try {
     const stream = await openai.responses.create({
       model: CHAT_MODEL,
+      modalities: ["text"],
+      reasoning: { effort: REASONING_EFFORT },
       stream: true,
       max_output_tokens: 80,
-      instructions: "Reply with EXACTLY one short, friendly sentence wrapped as <final>…</final>. Nothing else.",
+      instructions: "Reply with exactly one short sentence wrapped as <final>…</final>. Nothing else.",
       input: [{ role: "user", content: [{ type: "input_text", text: userMsg }]}],
     });
 
@@ -110,7 +146,7 @@ async function attemptStream(userMsg) {
     for await (const ev of stream) {
       if (ev.type === "response.output_text.delta") buf += ev.delta || "";
       if (ev.type === "response.output_text")       buf += ev.text || "";
-      if (buf.includes("</final>")) break; // early exit as soon as final is complete
+      if (buf.includes("</final>")) break;
     }
     const final = extractFinal(buf) || (buf ? buf.trim() : "");
     await dbg("gpt5_stream_done", { had_text: !!final, total_chars: buf.length });
@@ -121,13 +157,19 @@ async function attemptStream(userMsg) {
   }
 }
 
-/* Quick chat (short answer) */
+/* 2) Quick chat */
 async function attemptQuickChat(userMsg, maxTokens=CHAT_MAX_TOKENS) {
   const messages = [
     { role: "system", content: "Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else." },
     { role: "user", content: userMsg },
   ];
-  const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
+  const req = {
+    model: CHAT_MODEL,
+    messages,
+    modalities: ["text"],
+    reasoning: { effort: REASONING_EFFORT },
+    max_completion_tokens: maxTokens
+  };
 
   const r = await withTimeout(openai.chat.completions.create(req), "gpt5_quick", {
     model: req.model, maxTokens, input_preview: safeSlice(messages)
@@ -142,10 +184,12 @@ async function attemptQuickChat(userMsg, maxTokens=CHAT_MAX_TOKENS) {
   return final || (txt ? txt.trim() : null);
 }
 
-/* Responses (non-stream) */
+/* 3) Responses (non-stream) */
 async function attemptItems(userMsg) {
   const req = {
     model: CHAT_MODEL,
+    modalities: ["text"],
+    reasoning: { effort: REASONING_EFFORT },
     max_output_tokens: 120,
     instructions: "Return only one sentence wrapped like <final>…</final>. No other text.",
     input: [{ role:"user", content:[{ type:"input_text", text: userMsg }]}],
@@ -164,10 +208,12 @@ async function attemptItems(userMsg) {
   return final || null;
 }
 
-/* Minimal string-prompt path via Responses */
+/* 4) Minimal string-prompt via Responses */
 async function attemptString(userMsg) {
   const req = {
     model: CHAT_MODEL,
+    modalities: ["text"],
+    reasoning: { effort: REASONING_EFFORT },
     max_output_tokens: 80,
     input: `User: ${userMsg}\n\n<final>`
   };
@@ -184,13 +230,19 @@ async function attemptString(userMsg) {
   return final || null;
 }
 
-/* Chat retry with bigger cap */
+/* 5) Chat retry with bigger cap */
 async function attemptChatRetry(userMsg, maxTokens=CHAT_RETRY_TOKENS) {
   const messages = [
     { role: "system", content: "Return ONLY one short, friendly sentence. Wrap exactly as <final>your answer</final>." },
     { role: "user", content: userMsg },
   ];
-  const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
+  const req = {
+    model: CHAT_MODEL,
+    messages,
+    modalities: ["text"],
+    reasoning: { effort: REASONING_EFFORT },
+    max_completion_tokens: maxTokens
+  };
 
   const r = await withTimeout(openai.chat.completions.create(req), "gpt5_chat", {
     model: req.model, input_preview: safeSlice(messages), maxTokens
@@ -207,14 +259,15 @@ async function attemptChatRetry(userMsg, maxTokens=CHAT_RETRY_TOKENS) {
 
 /** Gatherer ----------------------------------------------------------- */
 async function gpt5Reply(userMsg) {
-  // Start multiple approaches and take the first that yields content
-  const pStream = attemptStream(userMsg); // null immediately if streaming disabled
-  const pQuick  = new Promise(res => setTimeout(async () => res(await attemptQuickChat(userMsg)),  80));
-  const pStr    = new Promise(res => setTimeout(async () => res(await attemptString(userMsg)),    140));
-  const pItems  = new Promise(res => setTimeout(async () => res(await attemptItems(userMsg)),     220));
-  const pRetry  = new Promise(res => setTimeout(async () => res(await attemptChatRetry(userMsg)), 700));
+  // New ordering: JSON → (optional) Stream → QuickChat → String → Items → ChatRetry
+  const pJson  = attemptJson(userMsg);
+  const pStream= attemptStream(userMsg); // null immediately if streaming disabled
+  const pQuick = new Promise(res => setTimeout(async () => res(await attemptQuickChat(userMsg)),  80));
+  const pStr   = new Promise(res => setTimeout(async () => res(await attemptString(userMsg)),    140));
+  const pItems = new Promise(res => setTimeout(async () => res(await attemptItems(userMsg)),     220));
+  const pRetry = new Promise(res => setTimeout(async () => res(await attemptChatRetry(userMsg)), 700));
 
-  const winner = firstTruthy([pStream, pQuick, pStr, pItems, pRetry]);
+  const winner = firstTruthy([pJson, pStream, pQuick, pStr, pItems, pRetry]);
   const watchdog = new Promise((resolve) =>
     setTimeout(() => { dbg("watchdog_fired", { ms: WATCHDOG_MS }); resolve("__WATCHDOG__"); }, WATCHDOG_MS)
   );
