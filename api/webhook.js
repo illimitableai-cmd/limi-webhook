@@ -13,25 +13,26 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-// 🔒 Hard-pin to GPT-5 (no fallback)
-const CHAT_MODEL         = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const CHAT_MAX_TOKENS    = Number(process.env.CHAT_MAX_TOKENS || 180);
-const CHAT_RETRY_TOKENS  = Number(process.env.CHAT_RETRY_TOKENS || 480);
+// 🔒 GPT-5 only (no fallback)
+const CHAT_MODEL        = process.env.OPENAI_CHAT_MODEL || "gpt-5";
+const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS || 120);  // modest, we return a short answer
+const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 180);
 
-const LLM_TIMEOUT_MS     = Number(process.env.LLM_TIMEOUT_MS || 11000);
-const WATCHDOG_MS        = Number(process.env.WATCHDOG_MS || 12500);
+const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS || 11000);
+const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS || 12500);
 
-const MAX_SMS_CHARS      = Number(process.env.SMS_MAX_CHARS || 320);
-const TWILIO_WA_FROM     = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
+const MAX_SMS_CHARS     = Number(process.env.SMS_MAX_CHARS || 320);
+const TWILIO_WA_FROM    = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
+
+// 🔧 Output shaping (tweak without code changes)
+const FINAL_MAX_CHARS       = Number(process.env.FINAL_MAX_CHARS || 240); // keep room for SMS
+const FINAL_MAX_SENTENCES   = Number(process.env.FINAL_MAX_SENTENCES || 2);
 
 /** --- Debug logging -------------------------------------------------- */
 async function dbg(step, payload) {
   try { console.log("[dbg]", step, payload); } catch {}
-  try {
-    if (supabase) await supabase.from("debug_logs").insert([{ step, payload }]);
-  } catch (e) {
-    console.log("[dbg-fail]", step, String(e?.message || e));
-  }
+  try { if (supabase) await supabase.from("debug_logs").insert([{ step, payload }]); }
+  catch (e) { console.log("[dbg-fail]", step, String(e?.message || e)); }
 }
 
 /** --- Utils ---------------------------------------------------------- */
@@ -49,22 +50,44 @@ function readRawBody(req) {
     req.on("error", reject);
   });
 }
-function smsNumber(s="") {
-  let v = String(s).replace(/^whatsapp:/i,"").trim();
+function smsNumber(s = "") {
+  let v = String(s).replace(/^whatsapp:/i, "").trim();
   if (v.startsWith("00")) v = "+" + v.slice(2);
   if (v.startsWith("0")) v = "+44" + v.slice(1);
   return v;
 }
-const safeSlice = (obj, n=220) => {
-  try { return JSON.stringify(obj).slice(0,n); } catch { return String(obj).slice(0,n); }
+const safeSlice = (obj, n = 220) => {
+  try { return JSON.stringify(obj).slice(0, n); } catch { return String(obj).slice(0, n); }
 };
-const extractFinal = (s="") => {
+const extractFinal = (s = "") => {
   const m = String(s).match(/<final>([\s\S]*?)<\/final>/i);
   return m ? m[1].trim() : "";
 };
 
+/** --- Finalization helpers ------------------------------------------ */
+function trimSentences(text, maxSentences = FINAL_MAX_SENTENCES) {
+  const parts = String(text || "").trim().split(/(?<=[.!?])\s+/);
+  return parts.slice(0, Math.max(1, maxSentences)).join(" ").trim();
+}
+function truncateChars(s, limit = FINAL_MAX_CHARS) {
+  const txt = (s || "").trim();
+  if (txt.length <= limit) return txt;
+  return txt.slice(0, limit - 1) + "…";
+}
+function coerceFinal(raw) {
+  // 1) If already wrapped, extract > trim sentences > truncate
+  const got = extractFinal(raw || "");
+  if (got) return `<final>${truncateChars(trimSentences(got))}</final>`;
+
+  // 2) Otherwise, make a concise snippet and wrap
+  const asText = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!asText) return "<final>I’m not sure.</final>";
+  const concise = truncateChars(trimSentences(asText));
+  return `<final>${concise}</final>`;
+}
+
 /** --- Timed wrapper -------------------------------------------------- */
-function withTimeout(promise, label, ctx={}) {
+function withTimeout(promise, label, ctx = {}) {
   dbg(label + "_request", ctx);
   return new Promise((resolve) => {
     const t = setTimeout(() => resolve({ __timeout: true }), LLM_TIMEOUT_MS);
@@ -74,21 +97,11 @@ function withTimeout(promise, label, ctx={}) {
 }
 
 /** --- OpenAI: GPT-5 chat.completions (no temperature) ---------------- */
-async function safeChatCompletion({
-  messages,
-  model = CHAT_MODEL,
-  maxTokens = CHAT_MAX_TOKENS
-}) {
+async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS }) {
   const isGpt5 = /^gpt-5/i.test(model);
-
-  const req = { model, messages };
-  if (isGpt5) {
-    req.max_completion_tokens = maxTokens; // GPT-5 field
-    // DO NOT set temperature for GPT-5
-  } else {
-    req.max_tokens = maxTokens;            // non-GPT-5 compatibility
-    req.temperature = 1;
-  }
+  const req = { model, messages, stop: ["</final>"] }; // encourage early stop at closing tag
+  if (isGpt5) req.max_completion_tokens = maxTokens;
+  else { req.max_tokens = maxTokens; req.temperature = 1; }
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
   const r = await withTimeout(openai.chat.completions.create(req), "openai_chat", { model, maxTokens });
@@ -103,31 +116,39 @@ async function safeChatCompletion({
 
 /** --- LLM reply helpers --------------------------------------------- */
 function systemInstruction() {
-  return `Reply with EXACTLY one short sentence wrapped as <final>…</final>. Nothing else.
-
-If the user asks a question, answer it in one short sentence. If you don't know, say so—still wrapped in <final> tags.`;
+  return [
+    "You must respond wrapped in <final> and </final>.",
+    `Goal: a clear, helpful answer in up to ${FINAL_MAX_SENTENCES} short sentence(s), max ${FINAL_MAX_CHARS} characters total inside the tags.`,
+    "Format example: <final>Answer here.</final>",
+    "Hard rules:",
+    "- Start with '<final>' and end with '</final>'.",
+    `- No more than ${FINAL_MAX_SENTENCES} sentence(s).`,
+    `- No more than ${FINAL_MAX_CHARS} characters inside the tags.`,
+    "- No preamble, no code blocks, no extra lines.",
+    "- If uncertain, write: <final>I’m not sure.</final>"
+  ].join("\n");
 }
 
 async function llmReply(userMsg) {
-  // Attempt 1: strict format
+  // Attempt 1: strict instruction with modest cap
   const messagesA = [
     { role: "system", content: systemInstruction() },
     { role: "user",   content: userMsg }
   ];
   let txt = await safeChatCompletion({ messages: messagesA, maxTokens: CHAT_MAX_TOKENS });
-  let final = extractFinal(txt || "");
-  if (!final && txt) final = txt.trim();
 
-  // Attempt 2: softer prompt + bigger cap
-  if (!final) {
+  // Attempt 2: lighter instruction + slightly larger cap
+  if (!extractFinal(txt || "")) {
     const messagesB = [
-      { role: "system", content: "Return a short, friendly answer. Wrap it as <final>...</final>." },
+      { role: "system", content: "Return a concise answer wrapped as <final>...</final> (max two short sentences, ~240 chars)." },
       { role: "user",   content: userMsg }
     ];
-    txt = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
-    final = extractFinal(txt || "") || (txt ? txt.trim() : "");
+    const retry = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
+    if (retry) txt = retry;
   }
-  return final || null;
+
+  // Guarantee valid wrapper
+  return coerceFinal(txt || "");
 }
 
 /** --- Twilio WhatsApp helper ---------------------------------------- */
@@ -143,11 +164,10 @@ async function sendWhatsApp(to, body) {
 export default async function handler(req, res) {
   try {
     await dbg("handler_enter", { ts: Date.now(), has_openai_key: !!process.env.OPENAI_KEY });
-
     if (req.method !== "POST") { res.status(405).send("Method Not Allowed"); return; }
 
     const raw = await readRawBody(req);
-    let Body=null, From=null, NumMedia=0;
+    let Body = null, From = null, NumMedia = 0;
 
     if (raw.trim().startsWith("{")) {
       const j = JSON.parse(raw);
@@ -190,12 +210,12 @@ export default async function handler(req, res) {
     );
     const final = await Promise.race([replyPromise, watchdog]);
 
-    const reply = final || "Sorry—service is a bit slow right now. Please try again.";
-    const safe  = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
+    const reply = final || "<final>Sorry—service is a bit slow right now. Please try again.</final>";
+    const safe = reply.length > MAX_SMS_CHARS ? reply.slice(0, MAX_SMS_CHARS - 1) + "…" : reply;
 
     if (isWhatsApp && TWILIO_WA_FROM) {
       try {
-        await sendWhatsApp(cleanFrom, safe);
+        await sendWhatsApp(cleanFrom, safe.replace(/^<final>|<\/final>$/g, "")); // WA doesn't need tags
         res.setHeader("Content-Type","text/xml");
         res.status(200).send("<Response/>");
         return;
@@ -204,7 +224,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // SMS reply (TwiML)
+    // SMS reply (TwiML) – keep tags; your client extracts or just shows nicely
     res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
     await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "sms_twiML" });
