@@ -16,8 +16,7 @@ const supabase =
 // 🔒 GPT-5 only (no fallback)
 const CHAT_MODEL        = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 
-// Token budgets: GPT-5 spends some on internal reasoning.
-// Give it headroom so it still has room to emit text.
+// Give GPT-5 enough headroom to think + answer, but keep it modest for SMS.
 const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS   || 360);
 const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 640);
 
@@ -99,92 +98,124 @@ function withTimeout(promise, label, ctx = {}) {
   });
 }
 
-/** --- OpenAI: GPT-5 chat.completions (no temperature/stop) ----------- */
-/**
- * For GPT-5, we try `reasoning: { effort: "low" }` to limit internal tokens.
- * If the API rejects that param, we automatically retry without it.
- */
-async function chatCreateWithOptionalReasoning(reqBase, tryReasoningLow = true) {
-  // First attempt
-  let r = await withTimeout(openai.chat.completions.create(reqBase), "openai_chat", { tryReasoningLow });
-  if (r?.__error && tryReasoningLow) {
-    const msg = String(r.__error?.message || r.__error || "");
-    if (/Unsupported parameter.*reasoning/i.test(msg) || /Unknown parameter.*reasoning/i.test(msg)) {
-      // Remove reasoning and retry once
-      const { reasoning, ...reqNoReasoning } = reqBase;
-      await dbg("openai_chat_retry_without_reasoning", { note: "reasoning param not supported" });
-      r = await withTimeout(openai.chat.completions.create(reqNoReasoning), "openai_chat_no_reasoning", {});
+/** --- Tools: force the answer via function call --------------------- */
+const FINALIZE_TOOL = [{
+  type: "function",
+  function: {
+    name: "finalize",
+    description: "Return the final user-facing answer text, concise and helpful.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: `The final answer text. Max ${FINAL_MAX_SENTENCES} short sentence(s), <= ${FINAL_MAX_CHARS} chars.`
+        }
+      },
+      required: ["text"],
+      additionalProperties: false
     }
   }
-  return r;
+}];
+
+/** --- OpenAI: Chat Completions for GPT-5 (no temp/stop) -------------- */
+async function chatCreate(reqBase) {
+  return withTimeout(openai.chat.completions.create(reqBase), "openai_chat", {
+    model: reqBase?.model, maxTokens: reqBase?.max_completion_tokens || reqBase?.max_tokens
+  });
 }
 
-async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS }) {
+async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS, tools, tool_choice }) {
   const isGpt5 = /^gpt-5/i.test(model);
 
-  // Build request; GPT-5 uses max_completion_tokens
   const req = { model, messages };
+  if (tools) req.tools = tools;
+  if (tool_choice) req.tool_choice = tool_choice;
+
   if (isGpt5) {
-    req.max_completion_tokens = maxTokens;
-    // Ask for low-effort reasoning to free budget for visible text
-    req.reasoning = { effort: "low" };
+    req.max_completion_tokens = maxTokens; // GPT-5 param
+    // Don’t send temperature/stop (unsupported for reasoning models). :contentReference[oaicite:1]{index=1}
   } else {
-    req.max_tokens = maxTokens;
+    req.max_tokens = maxTokens; // non-GPT-5 compat
     req.temperature = 1;
   }
 
-  await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
+  await dbg("openai_chat_request", { model, maxTokens, has_tools: !!tools, input_preview: safeSlice(messages) });
+  const r = await chatCreate(req);
 
-  // Call with optional reasoning (and auto-retry without if rejected)
-  const r = await chatCreateWithOptionalReasoning(req, isGpt5);
+  if (r?.__timeout) { await dbg("openai_chat_error", { message: "timeout" }); return { text: "", toolText: "" }; }
+  if (r?.__error)   { await dbg("openai_chat_error", { message: String(r.__error?.message || r.__error) }); return { text: "", toolText: "" }; }
 
-  if (r?.__timeout) { await dbg("openai_chat_error", { message: "timeout" }); return ""; }
-  if (r?.__error)   { await dbg("openai_chat_error", { message: String(r.__error?.message || r.__error) }); return ""; }
+  const choice = r?.choices?.[0];
+  const msg = choice?.message || {};
+  const text = (msg.content || "").trim();
 
-  const txt = r?.choices?.[0]?.message?.content ?? "";
+  // If the model used the tool, extract the arguments
+  let toolText = "";
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+    try {
+      const call = msg.tool_calls[0];
+      const args = JSON.parse(call?.function?.arguments || "{}");
+      toolText = String(args?.text || "").trim();
+    } catch {}
+  }
+
   await dbg("openai_chat_reply", {
-    has_content: !!txt,
+    has_content: !!text,
+    has_tool_text: !!toolText,
     usage: r?.usage,
-    finish_reason: r?.choices?.[0]?.finish_reason
+    finish_reason: choice?.finish_reason
   });
-  return (txt || "").trim();
+
+  return { text, toolText };
 }
 
 /** --- LLM reply helpers --------------------------------------------- */
 function systemInstruction() {
   return [
-    "You must respond wrapped in <final> and </final>.",
-    `Goal: a clear, helpful answer in up to ${FINAL_MAX_SENTENCES} short sentence(s), max ${FINAL_MAX_CHARS} characters total inside the tags.`,
-    "Format example: <final>Answer here.</final>",
-    "Hard rules:",
-    "- Start with '<final>' and end with '</final>'.",
-    `- No more than ${FINAL_MAX_SENTENCES} sentence(s).`,
-    `- No more than ${FINAL_MAX_CHARS} characters inside the tags.`,
-    "- No preamble, no code blocks, no extra lines.",
-    "- If uncertain, write: <final>I’m not sure.</final>"
+    "You are Limi’s SMS/WhatsApp brain.",
+    `You must produce the final answer by CALLING the function 'finalize' with a JSON { \"text\": \"...\" } containing up to ${FINAL_MAX_SENTENCES} short sentence(s), <= ${FINAL_MAX_CHARS} characters total.`,
+    "Do any reasoning silently; do NOT include extra messages.",
+    "The 'text' must be the complete, user-ready answer (no disclaimers, no tags)."
   ].join("\n");
 }
 
 async function llmReply(userMsg) {
-  // Attempt 1: strict instruction with a healthy cap
+  // Attempt 1: force a tool call
   const messagesA = [
     { role: "system", content: systemInstruction() },
     { role: "user",   content: userMsg }
   ];
-  let txt = await safeChatCompletion({ messages: messagesA, maxTokens: CHAT_MAX_TOKENS });
+  let { text, toolText } = await safeChatCompletion({
+    messages: messagesA,
+    maxTokens: CHAT_MAX_TOKENS,
+    tools: FINALIZE_TOOL,
+    tool_choice: { type: "function", function: { name: "finalize" } } // hard requirement
+  });
 
-  // Attempt 2: lighter instruction + larger cap
-  if (!extractFinal(txt || "")) {
+  // If tool produced text, prefer it
+  let out = toolText || text;
+
+  // Attempt 2: fallback to plain text formatting if tools ignored
+  if (!out) {
     const messagesB = [
-      { role: "system", content: "Return a concise answer wrapped as <final>...</final> (max two short sentences, ~240 chars)." },
-      { role: "user",   content: userMsg }
+      { role: "system", content: [
+          "Return ONLY the final answer, no preamble.",
+          `Use up to ${FINAL_MAX_SENTENCES} short sentence(s), <= ${FINAL_MAX_CHARS} characters.`,
+          "Wrap it exactly as <final>…</final>."
+        ].join("\n")
+      },
+      { role: "user", content: userMsg }
     ];
-    const retry = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
-    if (retry) txt = retry;
+    const second = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
+    out = second.text || second.toolText || "";
   }
 
-  // Guarantee valid wrapper no matter what
-  return coerceFinal(txt || "");
+  // Guarantee a wrapped, trimmed result
+  if (toolText) {
+    return `<final>${truncateChars(trimSentences(toolText))}</final>`;
+  }
+  return coerceFinal(out);
 }
 
 /** --- Twilio WhatsApp helper ---------------------------------------- */
@@ -262,7 +293,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // SMS reply (TwiML) – keep tags; your client can parse or show them
+    // SMS reply (TwiML)
     res.setHeader("Content-Type","text/xml");
     res.status(200).send(`<Response><Message>${toXml(safe)}</Message></Response>`);
     await dbg("twiml_sent", { to: cleanFrom, len: safe.length, mode: "sms_twiML" });
