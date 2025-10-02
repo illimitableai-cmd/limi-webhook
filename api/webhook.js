@@ -15,8 +15,11 @@ const supabase =
 
 // 🔒 GPT-5 only (no fallback)
 const CHAT_MODEL        = process.env.OPENAI_CHAT_MODEL || "gpt-5";
-const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS || 120);   // modest caps: concise replies
-const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 180);
+
+// Token budgets: GPT-5 spends some on internal reasoning.
+// Give it headroom so it still has room to emit text.
+const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS   || 360);
+const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 640);
 
 const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS || 11000);
 const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS || 12500);
@@ -96,27 +99,54 @@ function withTimeout(promise, label, ctx = {}) {
   });
 }
 
-/** --- OpenAI: GPT-5 chat.completions (no temperature, no stop) ------- */
+/** --- OpenAI: GPT-5 chat.completions (no temperature/stop) ----------- */
+/**
+ * For GPT-5, we try `reasoning: { effort: "low" }` to limit internal tokens.
+ * If the API rejects that param, we automatically retry without it.
+ */
+async function chatCreateWithOptionalReasoning(reqBase, tryReasoningLow = true) {
+  // First attempt
+  let r = await withTimeout(openai.chat.completions.create(reqBase), "openai_chat", { tryReasoningLow });
+  if (r?.__error && tryReasoningLow) {
+    const msg = String(r.__error?.message || r.__error || "");
+    if (/Unsupported parameter.*reasoning/i.test(msg) || /Unknown parameter.*reasoning/i.test(msg)) {
+      // Remove reasoning and retry once
+      const { reasoning, ...reqNoReasoning } = reqBase;
+      await dbg("openai_chat_retry_without_reasoning", { note: "reasoning param not supported" });
+      r = await withTimeout(openai.chat.completions.create(reqNoReasoning), "openai_chat_no_reasoning", {});
+    }
+  }
+  return r;
+}
+
 async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS }) {
   const isGpt5 = /^gpt-5/i.test(model);
 
+  // Build request; GPT-5 uses max_completion_tokens
   const req = { model, messages };
   if (isGpt5) {
-    req.max_completion_tokens = maxTokens;     // GPT-5 field
-    // Do NOT send temperature or stop for GPT-5
+    req.max_completion_tokens = maxTokens;
+    // Ask for low-effort reasoning to free budget for visible text
+    req.reasoning = { effort: "low" };
   } else {
-    req.max_tokens = maxTokens;                // compatibility if you ever switch
+    req.max_tokens = maxTokens;
     req.temperature = 1;
   }
 
   await dbg("openai_chat_request", { model, maxTokens, input_preview: safeSlice(messages) });
-  const r = await withTimeout(openai.chat.completions.create(req), "openai_chat", { model, maxTokens });
 
-  if (r?.__timeout) { await dbg("openai_chat_error", { message: "timeout" }); return null; }
-  if (r?.__error)   { await dbg("openai_chat_error", { message: String(r.__error?.message || r.__error) }); return null; }
+  // Call with optional reasoning (and auto-retry without if rejected)
+  const r = await chatCreateWithOptionalReasoning(req, isGpt5);
+
+  if (r?.__timeout) { await dbg("openai_chat_error", { message: "timeout" }); return ""; }
+  if (r?.__error)   { await dbg("openai_chat_error", { message: String(r.__error?.message || r.__error) }); return ""; }
 
   const txt = r?.choices?.[0]?.message?.content ?? "";
-  await dbg("openai_chat_reply", { has_content: !!txt, usage: r?.usage, finish_reason: r?.choices?.[0]?.finish_reason });
+  await dbg("openai_chat_reply", {
+    has_content: !!txt,
+    usage: r?.usage,
+    finish_reason: r?.choices?.[0]?.finish_reason
+  });
   return (txt || "").trim();
 }
 
@@ -136,14 +166,14 @@ function systemInstruction() {
 }
 
 async function llmReply(userMsg) {
-  // Attempt 1: strict instruction with modest cap
+  // Attempt 1: strict instruction with a healthy cap
   const messagesA = [
     { role: "system", content: systemInstruction() },
     { role: "user",   content: userMsg }
   ];
   let txt = await safeChatCompletion({ messages: messagesA, maxTokens: CHAT_MAX_TOKENS });
 
-  // Attempt 2: lighter instruction + slightly larger cap
+  // Attempt 2: lighter instruction + larger cap
   if (!extractFinal(txt || "")) {
     const messagesB = [
       { role: "system", content: "Return a concise answer wrapped as <final>...</final> (max two short sentences, ~240 chars)." },
@@ -153,7 +183,7 @@ async function llmReply(userMsg) {
     if (retry) txt = retry;
   }
 
-  // Guarantee valid wrapper
+  // Guarantee valid wrapper no matter what
   return coerceFinal(txt || "");
 }
 
