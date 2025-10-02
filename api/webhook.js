@@ -13,12 +13,12 @@ const supabase =
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
     : null;
 
-// 🔒 GPT-5 only (no fallback)
+// 🔒 GPT-5 only (no model fallback)
 const CHAT_MODEL        = process.env.OPENAI_CHAT_MODEL || "gpt-5";
 
-// Give GPT-5 enough headroom to think + answer, but keep it modest for SMS.
-const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS   || 360);
-const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 640);
+// Token budgets for Responses API (controls visible output only)
+const CHAT_MAX_TOKENS   = Number(process.env.CHAT_MAX_TOKENS   || 180);
+const CHAT_RETRY_TOKENS = Number(process.env.CHAT_RETRY_TOKENS || 240);
 
 const LLM_TIMEOUT_MS    = Number(process.env.LLM_TIMEOUT_MS || 11000);
 const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS || 12500);
@@ -26,7 +26,7 @@ const WATCHDOG_MS       = Number(process.env.WATCHDOG_MS || 12500);
 const MAX_SMS_CHARS     = Number(process.env.SMS_MAX_CHARS || 320);
 const TWILIO_WA_FROM    = (process.env.TWILIO_WHATSAPP_FROM || "").trim();
 
-// 🔧 Output shaping (tweak without code changes)
+// 🔧 Output shaping (tweak by env)
 const FINAL_MAX_CHARS     = Number(process.env.FINAL_MAX_CHARS || 240);
 const FINAL_MAX_SENTENCES = Number(process.env.FINAL_MAX_SENTENCES || 2);
 
@@ -58,13 +58,29 @@ function smsNumber(s = "") {
   if (v.startsWith("0")) v = "+44" + v.slice(1);
   return v;
 }
-const safeSlice = (obj, n = 220) => {
+const safeSlice = (obj, n = 300) => {
   try { return JSON.stringify(obj).slice(0, n); } catch { return String(obj).slice(0, n); }
 };
 const extractFinal = (s = "") => {
   const m = String(s).match(/<final>([\s\S]*?)<\/final>/i);
   return m ? m[1].trim() : "";
 };
+
+// Robustly pull text out of a Responses API object
+function deepFindText(resp) {
+  const out = [];
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (typeof node.output_text === "string") out.push(node.output_text);
+    if (typeof node.text === "string") out.push(node.text);
+    if (node.text && typeof node.text === "object" && typeof node.text.value === "string") out.push(node.text.value);
+    if (Array.isArray(node)) { for (const it of node) visit(it); return; }
+    if (Array.isArray(node.content)) for (const it of node.content) visit(it);
+    for (const k of Object.keys(node)) { const v=node[k]; if (v && typeof v === "object") visit(v); }
+  };
+  if (Array.isArray(resp?.output)) visit(resp.output); else visit(resp);
+  return out.join("").trim();
+}
 
 /** --- Finalization helpers ------------------------------------------ */
 function trimSentences(text, maxSentences = FINAL_MAX_SENTENCES) {
@@ -77,11 +93,8 @@ function truncateChars(s, limit = FINAL_MAX_CHARS) {
   return txt.slice(0, limit - 1) + "…";
 }
 function coerceFinal(raw) {
-  // 1) If already wrapped, extract > trim sentences > truncate
   const got = extractFinal(raw || "");
   if (got) return `<final>${truncateChars(trimSentences(got))}</final>`;
-
-  // 2) Otherwise, make a concise snippet and wrap
   const asText = String(raw || "").replace(/\s+/g, " ").trim();
   if (!asText) return "<final>I’m not sure.</final>";
   const concise = truncateChars(trimSentences(asText));
@@ -98,124 +111,77 @@ function withTimeout(promise, label, ctx = {}) {
   });
 }
 
-/** --- Tools: force the answer via function call --------------------- */
-const FINALIZE_TOOL = [{
-  type: "function",
-  function: {
-    name: "finalize",
-    description: "Return the final user-facing answer text, concise and helpful.",
-    parameters: {
-      type: "object",
-      properties: {
-        text: {
-          type: "string",
-          description: `The final answer text. Max ${FINAL_MAX_SENTENCES} short sentence(s), <= ${FINAL_MAX_CHARS} chars.`
-        }
-      },
-      required: ["text"],
-      additionalProperties: false
-    }
-  }
-}];
+/** --- OpenAI: Responses API (primary for GPT-5) --------------------- */
+// Keep it minimal: only model, input, max_output_tokens (others caused 400s in your logs)
+async function safeResponsesCompletion({ messages, maxTokens }) {
+  const req = { model: CHAT_MODEL, input: messages, max_output_tokens: maxTokens };
+  await dbg("openai_responses_request", { model: CHAT_MODEL, maxTokens, input_preview: safeSlice(messages) });
 
-/** --- OpenAI: Chat Completions for GPT-5 (no temp/stop) -------------- */
-async function chatCreate(reqBase) {
-  return withTimeout(openai.chat.completions.create(reqBase), "openai_chat", {
-    model: reqBase?.model, maxTokens: reqBase?.max_completion_tokens || reqBase?.max_tokens
-  });
+  const r = await withTimeout(openai.responses.create(req), "openai_responses", { model: CHAT_MODEL, maxTokens });
+
+  if (r?.__timeout) { await dbg("openai_responses_error", { message: "timeout" }); return ""; }
+  if (r?.__error)   { await dbg("openai_responses_error", { message: String(r.__error?.message || r.__error) }); return ""; }
+
+  const text = deepFindText(r);
+  await dbg("openai_responses_reply", { has_text: !!text, output_len: text.length, usage: r?.usage });
+  return (text || "").trim();
 }
 
-async function safeChatCompletion({ messages, model = CHAT_MODEL, maxTokens = CHAT_MAX_TOKENS, tools, tool_choice }) {
-  const isGpt5 = /^gpt-5/i.test(model);
+/** --- OpenAI: Chat Completions (fallback, still GPT-5) --------------- */
+// Only used if Responses returns empty; keeps GPT-5 and uses max_completion_tokens.
+async function safeChatCompletion({ messages, maxTokens }) {
+  const req = { model: CHAT_MODEL, messages, max_completion_tokens: maxTokens };
+  await dbg("openai_chat_request", { model: CHAT_MODEL, maxTokens, input_preview: safeSlice(messages) });
 
-  const req = { model, messages };
-  if (tools) req.tools = tools;
-  if (tool_choice) req.tool_choice = tool_choice;
+  const r = await withTimeout(openai.chat.completions.create(req), "openai_chat", { model: CHAT_MODEL, maxTokens });
 
-  if (isGpt5) {
-    req.max_completion_tokens = maxTokens; // GPT-5 param
-    // Don’t send temperature/stop (unsupported for reasoning models). :contentReference[oaicite:1]{index=1}
-  } else {
-    req.max_tokens = maxTokens; // non-GPT-5 compat
-    req.temperature = 1;
-  }
+  if (r?.__timeout) { await dbg("openai_chat_error", { message: "timeout" }); return ""; }
+  if (r?.__error)   { await dbg("openai_chat_error", { message: String(r.__error?.message || r.__error) }); return ""; }
 
-  await dbg("openai_chat_request", { model, maxTokens, has_tools: !!tools, input_preview: safeSlice(messages) });
-  const r = await chatCreate(req);
-
-  if (r?.__timeout) { await dbg("openai_chat_error", { message: "timeout" }); return { text: "", toolText: "" }; }
-  if (r?.__error)   { await dbg("openai_chat_error", { message: String(r.__error?.message || r.__error) }); return { text: "", toolText: "" }; }
-
-  const choice = r?.choices?.[0];
-  const msg = choice?.message || {};
-  const text = (msg.content || "").trim();
-
-  // If the model used the tool, extract the arguments
-  let toolText = "";
-  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-    try {
-      const call = msg.tool_calls[0];
-      const args = JSON.parse(call?.function?.arguments || "{}");
-      toolText = String(args?.text || "").trim();
-    } catch {}
-  }
-
-  await dbg("openai_chat_reply", {
-    has_content: !!text,
-    has_tool_text: !!toolText,
-    usage: r?.usage,
-    finish_reason: choice?.finish_reason
-  });
-
-  return { text, toolText };
+  const txt = r?.choices?.[0]?.message?.content ?? "";
+  await dbg("openai_chat_reply", { has_content: !!txt, usage: r?.usage, finish_reason: r?.choices?.[0]?.finish_reason });
+  return (txt || "").trim();
 }
 
 /** --- LLM reply helpers --------------------------------------------- */
 function systemInstruction() {
   return [
     "You are Limi’s SMS/WhatsApp brain.",
-    `You must produce the final answer by CALLING the function 'finalize' with a JSON { \"text\": \"...\" } containing up to ${FINAL_MAX_SENTENCES} short sentence(s), <= ${FINAL_MAX_CHARS} characters total.`,
-    "Do any reasoning silently; do NOT include extra messages.",
-    "The 'text' must be the complete, user-ready answer (no disclaimers, no tags)."
+    `Return the final answer wrapped as <final>...</final>, up to ${FINAL_MAX_SENTENCES} short sentence(s), max ${FINAL_MAX_CHARS} characters inside the tags.`,
+    "No preamble, no code blocks, no extra lines.",
+    "If uncertain, reply: <final>I’m not sure.</final>"
   ].join("\n");
 }
 
 async function llmReply(userMsg) {
-  // Attempt 1: force a tool call
-  const messagesA = [
+  // Attempt 1: Responses API
+  const msgsA = [
     { role: "system", content: systemInstruction() },
     { role: "user",   content: userMsg }
   ];
-  let { text, toolText } = await safeChatCompletion({
-    messages: messagesA,
-    maxTokens: CHAT_MAX_TOKENS,
-    tools: FINALIZE_TOOL,
-    tool_choice: { type: "function", function: { name: "finalize" } } // hard requirement
-  });
+  let txt = await safeResponsesCompletion({ messages: msgsA, maxTokens: CHAT_MAX_TOKENS });
 
-  // If tool produced text, prefer it
-  let out = toolText || text;
-
-  // Attempt 2: fallback to plain text formatting if tools ignored
-  if (!out) {
-    const messagesB = [
-      { role: "system", content: [
-          "Return ONLY the final answer, no preamble.",
-          `Use up to ${FINAL_MAX_SENTENCES} short sentence(s), <= ${FINAL_MAX_CHARS} characters.`,
-          "Wrap it exactly as <final>…</final>."
-        ].join("\n")
-      },
-      { role: "user", content: userMsg }
+  // Attempt 2: Responses API retry with simpler instruction + larger cap
+  if (!extractFinal(txt || "")) {
+    const msgsB = [
+      { role: "system", content: `Return ONLY: <final>…</final>. Max ${FINAL_MAX_SENTENCES} sentences, ${FINAL_MAX_CHARS} chars.` },
+      { role: "user",   content: userMsg }
     ];
-    const second = await safeChatCompletion({ messages: messagesB, maxTokens: CHAT_RETRY_TOKENS });
-    out = second.text || second.toolText || "";
+    const retry = await safeResponsesCompletion({ messages: msgsB, maxTokens: CHAT_RETRY_TOKENS });
+    if (retry) txt = retry;
   }
 
-  // Guarantee a wrapped, trimmed result
-  if (toolText) {
-    return `<final>${truncateChars(trimSentences(toolText))}</final>`;
+  // Fallback: Chat Completions (still GPT-5)
+  if (!extractFinal(txt || "")) {
+    const msgsC = [
+      { role: "system", content: systemInstruction() },
+      { role: "user",   content: userMsg }
+    ];
+    const alt = await safeChatCompletion({ messages: msgsC, maxTokens: CHAT_MAX_TOKENS });
+    if (alt) txt = alt;
   }
-  return coerceFinal(out);
+
+  return coerceFinal(txt || "");
 }
 
 /** --- Twilio WhatsApp helper ---------------------------------------- */
